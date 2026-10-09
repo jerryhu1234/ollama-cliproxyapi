@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ollama Quota</title>
+<style>
+:root {
+  --bg-primary: #f0eee8;
+  --bg-secondary: #faf9f5;
+  --bg-tertiary: #e9e6df;
+  --text-primary: #2d2a26;
+  --text-secondary: #6d6760;
+  --text-tertiary: #a29c95;
+  --border-color: #e3e1db;
+  --primary-color: #8b8680;
+  --primary-hover: #7f7a74;
+  --success-color: #188038;
+  --warning-color: #b06000;
+  --error-color: #b3261e;
+  --radius-md: 8px;
+  --shadow: 0 1px 3px rgba(45, 42, 38, .12);
+}
+[data-theme="white"] {
+  --bg-primary: #f0eee8;
+  --bg-secondary: #faf9f5;
+  --bg-tertiary: #e9e6df;
+  --text-primary: #2d2a26;
+  --text-secondary: #6d6760;
+  --text-tertiary: #a29c95;
+  --border-color: #e3e1db;
+}
+[data-theme="dark"] {
+  --bg-primary: #1d1b18;
+  --bg-secondary: #151412;
+  --bg-tertiary: #262320;
+  --text-primary: #f0eee8;
+  --text-secondary: #b8b1a8;
+  --text-tertiary: #8d867e;
+  --border-color: #3c3833;
+  --primary-color: #8f8981;
+  --primary-hover: #a29b92;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .35);
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--bg-secondary); font: 14px/1.45 system-ui, sans-serif; }
+.quota-page { max-width: 1160px; margin: 0 auto; }
+.quota-header { margin-bottom: 24px; }
+.quota-header-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.quota-title { margin: 0; font-size: 28px; font-weight: 700; line-height: 1.2; }
+.quota-description { margin: 8px 0 0; color: var(--text-secondary); }
+.quota-summary { margin: 14px 0 0; color: var(--text-secondary); font-size: 13px; }
+.quota-summary strong { color: var(--text-primary); }
+.quota-batch { flex: 0 0 auto; border: 1px solid var(--primary-color); border-radius: 8px; padding: 9px 13px; color: #fff; background: var(--primary-color); font: inherit; font-size: 13px; cursor: pointer; }
+.quota-batch:hover { background: var(--primary-hover); }
+.quota-batch:disabled { cursor: not-allowed; opacity: .6; }
+.quota-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
+.quota-card { padding: 20px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-primary); box-shadow: var(--shadow); }
+.quota-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.credential-badge { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; color: #fff; background: var(--primary-color); font-size: 12px; font-weight: 700; }
+.credential-name { margin: 0; min-width: 0; overflow-wrap: anywhere; font-size: 16px; font-weight: 600; }
+.quota-row { padding: 14px 0; border-top: 1px solid var(--border-color); }
+.quota-row-header, .quota-meta { display: flex; justify-content: space-between; gap: 12px; }
+.quota-label { font-weight: 600; text-transform: capitalize; }
+.quota-percent { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.quota-track { height: 8px; margin: 8px 0 6px; overflow: hidden; border-radius: 999px; background: var(--bg-tertiary); }
+.quota-fill { height: 100%; border-radius: inherit; background: var(--success-color); transition: width .2s ease; }
+.quota-fill.is-exceeded { background: var(--error-color); }
+.quota-meta.is-exceeded { color: var(--error-color); }
+.quota-meta { color: var(--text-secondary); font-size: 12px; }
+.quota-actions { display: flex; align-items: center; gap: 10px; margin-top: 18px; }
+.quota-refresh { border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 10px; color: var(--text-primary); background: var(--bg-tertiary); font: inherit; font-size: 12px; cursor: pointer; }
+.quota-refresh:hover { border-color: var(--primary-color); background: var(--bg-primary); }
+.quota-refresh:disabled { cursor: not-allowed; opacity: .6; }
+.quota-error { color: var(--error-color); }
+.quota-warning { color: var(--warning-color); }
+.quota-stale { color: var(--warning-color); }
+.quota-muted { color: var(--text-secondary); }
+.quota-error + .quota-help { margin-top: 6px; color: var(--text-secondary); }
+.quota-facts { margin: 10px 0 0; padding: 0; list-style: none; }
+.quota-facts li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px dashed var(--border-color); font-size: 12px; }
+.quota-facts li:first-child { border-top: 0; }
+.quota-facts .k { color: var(--text-secondary); }
+.quota-facts .v { font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
+@media (max-width: 768px) {
+  body { padding: 20px 16px; }
+  .quota-grid { grid-template-columns: 1fr; }
+  .quota-header-row { align-items: stretch; flex-direction: column; }
+  .quota-batch { width: 100%; }
+}
+</style>
+</head>
+<body>
+<div class="quota-page">
+  <header class="quota-header"><div class="quota-header-row"><div><h1 class="quota-title">Ollama Quota</h1><p class="quota-description">Balance and usage for each configured credential. Cloud keys refresh on demand (10 req/min account limit).</p></div><button id="refresh-all" class="quota-batch" type="button" disabled>Refresh all</button></div><p id="quota-summary" class="quota-summary" role="status" aria-live="polite">Loading credentials...</p></header>
+  <main id="app"><p class="quota-muted">Loading credentials...</p></main>
+</div>
+<script>
+(() => {
+  try {
+    const parentDocument = window.parent && window.parent !== window ? window.parent.document : null;
+    const parentRoot = parentDocument && parentDocument.documentElement;
+    const syncTheme = () => {
+      if (!parentRoot) return;
+      const theme = parentRoot.getAttribute("data-theme");
+      if (theme === "white" || theme === "dark") document.documentElement.setAttribute("data-theme", theme);
+      else document.documentElement.removeAttribute("data-theme");
+      const secondary = getComputedStyle(parentRoot).getPropertyValue("--bg-secondary").trim();
+      if (secondary) document.documentElement.style.setProperty("--bg-secondary", secondary);
+      document.body.style.backgroundColor = secondary || "var(--bg-secondary)";
+      if (window.frameElement) {
+        window.frameElement.style.backgroundColor = secondary || "transparent";
+        if (window.frameElement.parentElement) window.frameElement.parentElement.style.backgroundColor = secondary || "transparent";
+      }
+    };
+    syncTheme();
+    if (parentRoot) new MutationObserver(syncTheme).observe(parentRoot, {attributes: true, attributeFilter: ["data-theme"]});
+  } catch (_) {}
+})();
+</script>
+<script>
+(() => {
+  const app = document.getElementById("app");
+  const endpoint = "/v0/management/plugins/ollama-cliproxyapi/quota-usage";
+  const storageKey = "ollama-cliproxyapi:quota";
+  const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+  const values = new Map();
+  const labels = new Map();
+  const fetchedAt = new Map();
+  const errors = new Map();
+  const inFlight = new Set();
+  const queued = new Set();
+  const jobs = new Map();
+  const queue = [];
+  let activeJobs = 0;
+  let batchActive = false;
+  let batchState = null;
+  let pageAuthKey = "";
+  let cache = Object.create(null);
+  let cacheStorage = "local";
+  function validKeyID(keyID) { return typeof keyID === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(keyID); }
+  function cleanRow(row) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+    const clean = {};
+    ["percent", "used", "cap"].forEach(name => { if (typeof row[name] === "number" && Number.isFinite(row[name])) clean[name] = row[name]; });
+    if (typeof row.name === "string" && row.name.length <= 40) clean.name = row.name;
+    if (typeof row.label === "string" && row.label.length <= 80) clean.label = row.label;
+    if (typeof row.status === "string" && row.status.length <= 40) clean.status = row.status;
+    if (typeof row.resets_at === "string" && row.resets_at.length <= 80) clean.resets_at = row.resets_at;
+    if (typeof row.text === "string" && row.text.length <= 200) clean.text = row.text;
+    return Object.keys(clean).length ? clean : null;
+  }
+  function cleanMetric(metric) {
+    if (!metric || typeof metric !== "object" || Array.isArray(metric)) return null;
+    const clean = {};
+    if (typeof metric.label === "string" && metric.label.length <= 80) clean.label = metric.label;
+    if (typeof metric.value === "string" && metric.value.length <= 200) clean.value = metric.value;
+    return clean.label && clean.value ? clean : null;
+  }
+  function cleanUsage(usage) {
+    if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
+    const clean = {};
+    if (Array.isArray(usage.rows)) { const rows = usage.rows.map(cleanRow).filter(Boolean); if (rows.length) clean.rows = rows; }
+    if (Array.isArray(usage.metrics)) { const metrics = usage.metrics.map(cleanMetric).filter(Boolean); if (metrics.length) clean.metrics = metrics; }
+    return clean.rows || clean.metrics ? clean : null;
+  }
+  function readCache(storage) {
+    try {
+      const stored = storage.getItem(storageKey); const parsed = stored ? JSON.parse(stored) : {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return Object.create(null);
+      const result = Object.create(null);
+      Object.entries(parsed).forEach(([keyID, entry]) => {
+        if (!validKeyID(keyID) || !entry || typeof entry !== "object") return;
+        const usage = cleanUsage(entry.usage);
+        if (!usage || typeof entry.fetched_at !== "string" || !entry.fetched_at || Number.isNaN(Date.parse(entry.fetched_at))) return;
+        result[keyID] = {usage, fetched_at: entry.fetched_at, label: typeof entry.label === "string" ? entry.label.slice(0, 200) : ""};
+      });
+      return result;
+    } catch (_) { return null; }
+  }
+  let localCache = readCache(localStorage);
+  if (localCache !== null) cache = localCache;
+  else { cacheStorage = "session"; cache = readCache(sessionStorage) || Object.create(null); }
+  if (!Object.keys(cache).length && cacheStorage === "local") {
+    const legacy = readCache(sessionStorage);
+    if (legacy && Object.keys(legacy).length) { cache = legacy; try { localStorage.setItem(storageKey, JSON.stringify(cache)); } catch (_) { cacheStorage = "session"; } }
+  }
+  Object.entries(cache).forEach(([keyID, entry]) => {
+    if (!entry || typeof entry !== "object" || !entry.usage || typeof entry.usage !== "object") return;
+    values.set(keyID, entry.usage);
+    if (typeof entry.label === "string" && entry.label) labels.set(keyID, entry.label);
+    if (typeof entry.fetched_at === "string") fetchedAt.set(keyID, entry.fetched_at);
+  });
+  function saveCache() {
+    try {
+      if (cacheStorage === "local") localStorage.setItem(storageKey, JSON.stringify(cache));
+      else sessionStorage.setItem(storageKey, JSON.stringify(cache));
+    } catch (_) {
+      if (cacheStorage === "local") { cacheStorage = "session"; try { sessionStorage.setItem(storageKey, JSON.stringify(cache)); } catch (_) {} }
+    }
+  }
+  function applyUsage(keyID, usage, label) {
+    if (!validKeyID(keyID)) return;
+    const safeUsage = cleanUsage(usage); if (!safeUsage) return;
+    const timestamp = new Date().toISOString();
+    values.set(keyID, safeUsage);
+    if (label) labels.set(keyID, label);
+    fetchedAt.set(keyID, timestamp);
+    cache[keyID] = {usage: safeUsage, fetched_at: timestamp, label: labels.get(keyID) || ""};
+    saveCache();
+  }
+  function safeError() { return "Quota refresh failed"; }
+  function updateBatch(result) {
+    if (!batchState) return;
+    if (result.ok) batchState.success++; else batchState.failed++;
+    batchState.done++;
+    render(batchState.cards);
+  }
+  function pump() {
+    while (activeJobs < 2 && queue.length) {
+      const job = queue.shift();
+      queued.delete(job.card.key_id); inFlight.add(job.card.key_id); activeJobs++;
+      errors.delete(job.card.key_id); render(job.cards);
+      request({key_id: job.card.key_id}).then(result => {
+        // The management response is allowed to contain an upstream-facing
+        // diagnostic. Never put that diagnostic in the page; the server has
+        // already reduced transport failures to a safe card error where
+        // possible, and the UI keeps its own message generic regardless.
+        if (result.error) throw new Error("Quota refresh failed");
+        applyUsage(job.card.key_id, result.usage, result.label);
+        job.result = {ok: true, key_id: job.card.key_id};
+        return job.result;
+      }).catch(error => {
+        errors.set(job.card.key_id, safeError(error));
+        job.result = {ok: false, key_id: job.card.key_id, error: safeError(error)};
+        return job.result;
+      }).then(result => {
+        inFlight.delete(job.card.key_id); activeJobs--;
+        job.resolve(result); updateBatch(result); render(job.cards); pump();
+      });
+    }
+  }
+  function refreshCard(card, cards) {
+    const existing = jobs.get(card.key_id);
+    if (existing) return existing.promise;
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    const job = {card, cards, resolve, promise};
+    jobs.set(card.key_id, job); queued.add(card.key_id); queue.push(job); render(cards); pump();
+    promise.then(() => jobs.delete(card.key_id));
+    return promise;
+  }
+  function refreshAll(cards) {
+    if (batchActive || !cards.length) return Promise.resolve([]);
+    batchActive = true; batchState = {cards, total: cards.length, done: 0, success: 0, failed: 0};
+    render(cards);
+    const promises = cards.map(card => refreshCard(card, cards));
+    return Promise.all(promises).then(results => { batchActive = false; render(cards); return results; });
+  }
+  function authStatus() {
+    const missing = status => ({key: "", status});
+    let raw;
+    try {
+      try { raw = localStorage.getItem("cli-proxy-auth"); }
+      catch (_) { return missing("storage-blocked"); }
+      if (raw == null || raw === "") return missing("missing");
+      let decoded = raw;
+      if (raw.startsWith("enc::v1::") || raw.startsWith("enc::v2::")) {
+        const encoded = raw.slice(9);
+        if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) return missing("decode-invalid");
+        const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+        const seedText = raw.startsWith("enc::v2::") ? "cli-proxy-api-webui::secure-storage|v2|" + location.host : "cli-proxy-api-webui::secure-storage|" + location.host + "|" + navigator.userAgent;
+        const seed = new TextEncoder().encode(seedText);
+        for (let i = 0; i < bytes.length; i++) bytes[i] ^= seed[i % seed.length];
+        decoded = new TextDecoder("utf-8", {fatal: true}).decode(bytes);
+      } else if (raw.startsWith("enc::")) {
+        return missing("unsupported-format");
+      }
+      const parsed = JSON.parse(decoded);
+      if (parsed && parsed.state && typeof parsed.state.managementKey === "string" && parsed.state.managementKey) return {key: parsed.state.managementKey, status: "ok"};
+      return missing("key-missing");
+    } catch (_) { return missing("decode-invalid"); }
+  }
+  function auth() {
+    const result = authStatus();
+    if (result.key) pageAuthKey = result.key;
+    return result.key;
+  }
+  function authMessage(status) {
+    const messages = {
+      "storage-blocked": "Management Center credentials are unavailable here. Your browser may be blocking storage in this embedded page.",
+      missing: "Management Center credentials were not found. Confirm Remember password is enabled in Management Center, and open this page with Manager and CPA on the same origin (scheme, hostname, and port), then try again.",
+      "unsupported-format": "Management Center credentials use a newer storage format. Reload the Management Center and try again.",
+      "decode-invalid": "Management Center credentials could not be decoded. Reload the Management Center and try again.",
+      "key-missing": "Management Center storage is present, but it does not contain a management key. Sign in again and try again."
+    };
+    return messages[status] || "Management Center credentials could not be read. Try again.";
+  }
+  function request(body) {
+    const headers = {"Content-Type": "application/json"};
+    if (!pageAuthKey) return Promise.reject(new Error(authMessage("missing")));
+    headers.Authorization = "Bearer " + pageAuthKey;
+    return fetch(endpoint, {method: "POST", headers, body: JSON.stringify(body)}).then(async response => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (response.status === 401) throw new Error("Management API rejected these credentials (401). Sign in again in Management Center, then retry.");
+        if (response.status === 403) throw new Error("Management API denied access (403). Check your Management Center permissions.");
+        throw new Error(response.status >= 500 ? "Management API is temporarily unavailable. Try again." : "Management API request failed. Try again.");
+      }
+      return data;
+    });
+  }
+  function renderFacts(factsList, usage) {
+    (usage.metrics || []).forEach(metric => {
+      const li = document.createElement("li");
+      const k = document.createElement("span"); k.className = "k"; k.textContent = metric.label;
+      const v = document.createElement("span"); v.className = "v"; v.textContent = metric.value;
+      li.append(k, v); factsList.appendChild(li);
+    });
+  }
+  function renderUsage(row, usage) {
+    const value = document.createElement("div"); value.className = "quota-percent";
+    const hasBar = Number(usage.cap) > 0 || Number(usage.percent) > 0;
+    if (hasBar) {
+      const track = document.createElement("div"); track.className = "quota-track";
+      const fill = document.createElement("div"); fill.className = usage.status === "exceeded" ? "quota-fill is-exceeded" : "quota-fill";
+      const percent = Math.max(0, Math.min(100, Number(usage.percent) || 0));
+      fill.style.width = percent + "%";
+      track.setAttribute("role", "progressbar"); track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100"); track.setAttribute("aria-valuenow", String(percent)); track.setAttribute("aria-label", "Quota used"); track.appendChild(fill);
+      value.textContent = percent + "%";
+      row.appendChild(value); row.appendChild(track);
+    }
+    const meta = document.createElement("div"); meta.className = usage.status === "exceeded" ? "quota-meta is-exceeded" : "quota-meta";
+    const parts = [usage.status || "ok"];
+    if (usage.text) parts.push(usage.text);
+    if (usage.resets_at) {
+      const reset = new Date(usage.resets_at);
+      if (!Number.isNaN(reset.getTime())) parts.push("resets " + reset.toLocaleString());
+    }
+    const metaText = document.createElement("span"); metaText.textContent = parts.join(" · ");
+    meta.appendChild(metaText);
+    row.appendChild(meta);
+  }
+  function render(cards) {
+    app.textContent = "";
+    const batchButton = document.getElementById("refresh-all");
+    const summary = document.getElementById("quota-summary");
+    if (batchButton) { batchButton.disabled = batchActive || !cards.length; batchButton.textContent = batchActive ? "Refreshing all..." : "Refresh all"; }
+    if (summary) {
+      if (batchState && batchActive) summary.textContent = "Refreshing " + batchState.done + " of " + batchState.total + " accounts" + (batchState.failed ? " · " + batchState.failed + " failed" : "");
+      else if (batchState && batchState.done === batchState.total) summary.textContent = "Finished: " + batchState.success + " succeeded, " + batchState.failed + " failed";
+      else summary.textContent = cards.length ? cards.length + " configured account" + (cards.length === 1 ? "" : "s") : "No configured credentials.";
+    }
+    if (!cards.length) { const p = document.createElement("p"); p.className = "quota-muted"; p.setAttribute("role", "status"); p.textContent = "No configured credentials."; app.appendChild(p); return; }
+    const grid = document.createElement("div"); grid.className = "quota-grid";
+    cards.forEach(card => {
+      const section = document.createElement("section"); section.className = "quota-card";
+      const header = document.createElement("div"); header.className = "quota-card-header";
+      const cached = values.get(card.key_id);
+      const badge = document.createElement("span"); badge.className = "credential-badge"; badge.textContent = "OL"; badge.setAttribute("aria-hidden", "true");
+      const title = document.createElement("h2"); title.className = "credential-name"; title.textContent = labels.get(card.key_id) || card.label; header.append(badge, title); section.appendChild(header);
+      const usage = cached;
+      if (usage) {
+        (usage.rows || []).forEach(rowData => {
+          const row = document.createElement("div"); row.className = "quota-row";
+          const rowHeader = document.createElement("div"); rowHeader.className = "quota-row-header"; const label = document.createElement("span"); label.className = "quota-label"; label.textContent = rowData.label || rowData.name || "window"; rowHeader.appendChild(label); row.appendChild(rowHeader);
+          renderUsage(row, rowData);
+          section.appendChild(row);
+        });
+        const facts = document.createElement("ul"); facts.className = "quota-facts";
+        renderFacts(facts, usage);
+        if (facts.childElementCount) section.appendChild(facts);
+      } else {
+        const pending = document.createElement("div"); pending.className = "quota-meta"; pending.textContent = "Not refreshed"; section.appendChild(pending);
+      }
+      const updated = fetchedAt.get(card.key_id);
+      if (updated) {
+        const timestamp = document.createElement("div");
+        const stale = Date.now() - Date.parse(updated) > CACHE_MAX_AGE_MS;
+        timestamp.className = stale ? "quota-meta quota-stale" : "quota-meta";
+        timestamp.textContent = (stale ? "Stale · last refreshed " : "Last refreshed ") + new Date(updated).toLocaleString();
+        section.appendChild(timestamp);
+      }
+      const actions = document.createElement("div"); actions.className = "quota-actions";
+       const busy = inFlight.has(card.key_id) || queued.has(card.key_id);
+       const button = document.createElement("button"); button.className = "quota-refresh"; button.textContent = busy ? (inFlight.has(card.key_id) ? "Refreshing..." : "Queued...") : "Refresh"; button.disabled = busy; button.setAttribute("aria-label", "Refresh " + card.label);
+      const error = document.createElement("span"); error.className = "quota-error"; error.setAttribute("role", "status"); error.textContent = errors.get(card.key_id) || "";
+      button.onclick = () => { refreshCard(card, cards); };
+      actions.append(button, error); section.appendChild(actions); grid.appendChild(section);
+    });
+    app.appendChild(grid);
+   }
+   document.getElementById("refresh-all").onclick = () => { if (currentCards) refreshAll(currentCards); };
+   let currentCards = [];
+  function showMessage(message, help) {
+    app.textContent = "";
+    const p = document.createElement("p"); p.className = "quota-error"; p.setAttribute("role", "status"); p.textContent = message; app.appendChild(p);
+    if (help) { const h = document.createElement("p"); h.className = "quota-help"; h.textContent = help; app.appendChild(h); }
+  }
+  let initialAuth = authStatus();
+  if (initialAuth.key) {
+    pageAuthKey = initialAuth.key;
+  } else {
+    // A sandboxed/cross-origin iframe can briefly deny storage. One fresh read is
+    // useful, but do not retry the management request or start another list.
+    const retryAuth = initialAuth.status === "storage-blocked" ? authStatus() : initialAuth;
+    if (!retryAuth.key) { showMessage(authMessage(retryAuth.status), "Open this page from the Management Center after signing in. Credentials are never entered or stored here."); return; }
+    pageAuthKey = retryAuth.key;
+  }
+  request({}).then(result => {
+    const cards = result.cards || [];
+    currentCards = cards;
+    const configured = new Set(cards.map(card => card.key_id));
+    Object.keys(cache).forEach(keyID => {
+      if (!configured.has(keyID)) { delete cache[keyID]; values.delete(keyID); labels.delete(keyID); fetchedAt.delete(keyID); }
+    });
+    cards.forEach(card => {
+      if (!labels.has(card.key_id)) labels.set(card.key_id, card.label);
+    });
+    saveCache();
+    render(cards);
+    // Auto-refresh only keys with no cached snapshot yet; repeat visits
+    // respect the upstream's 10 req/min account rate limit.
+    cards.filter(card => !values.get(card.key_id)).forEach(card => refreshCard(card, cards));
+  }).catch(err => { app.textContent = ""; const p = document.createElement("p"); p.className = "quota-error"; p.setAttribute("role", "status"); p.textContent = err.message || "Unable to load credentials."; app.appendChild(p); });
+})();
+</script>
+</body>
+</html>

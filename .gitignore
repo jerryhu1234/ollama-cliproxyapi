@@ -1,0 +1,7 @@
+dist/
+plugins/
+*.so
+*.dylib
+*.dll
+*.h
+mgr-git-114/
