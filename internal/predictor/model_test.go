@@ -210,6 +210,21 @@ func TestWindowViewUnitSemantics(t *testing.T) {
 	}
 }
 
+func TestWindowViewPurchasedNeutral(t *testing.T) {
+	base := time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)
+	now := base.Add(5 * time.Hour)
+	// F2: the capless purchased channel drained to zero reads neutral —
+	// money has no reset cycle; the same zero on the included window stays
+	// exhausted.
+	drained := linearSeries(base, 11, 0, 1, time.Hour)
+	if v := buildWindowView(WindowPurchased, drained, now, nil, SamplingRateSource{}, false); v.State != StateNone {
+		t.Fatalf("purchased drained state = %q", v.State)
+	}
+	if v := buildWindowView(WindowIncluded, drained, now, nil, SamplingRateSource{}, false); v.State != StateExhausted {
+		t.Fatalf("included drained state = %q", v.State)
+	}
+}
+
 func TestViewGatingAnnotation(t *testing.T) {
 	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
 	session := func() WindowView {
@@ -289,6 +304,25 @@ func TestAccountStatusDerivation(t *testing.T) {
 	}
 	if av = view(s, "u"); av.Status != StatusExhausted {
 		t.Fatalf("included-empty status = %q", av.Status)
+	}
+
+	// F3/D8: an empty included window with purchased balance keeps the
+	// account serving; once the buffer drains too, the account goes dark.
+	s = NewStore(24 * time.Hour)
+	for i, rem := range []float64{10, 5, 0} {
+		s.Apply(AccountSnapshot{KeyID: "b", At: now.Add(time.Duration(i-2) * time.Hour),
+			Included: &USDWindow{Remaining: rem, Cap: 25}, PurchasedUSD: 8})
+	}
+	if av = view(s, "b"); av.Status != StatusReady {
+		t.Fatalf("purchased-buffered status = %q", av.Status)
+	}
+	s = NewStore(24 * time.Hour)
+	for i, rem := range []float64{10, 5, 0} {
+		s.Apply(AccountSnapshot{KeyID: "bd", At: now.Add(time.Duration(i-2) * time.Hour),
+			Included: &USDWindow{Remaining: rem, Cap: 25}, PurchasedUSD: rem / 5})
+	}
+	if av = view(s, "bd"); av.Status != StatusExhausted {
+		t.Fatalf("drained-buffer status = %q", av.Status)
 	}
 
 	// Purchased drains to zero freely — billing channel, never a gate.

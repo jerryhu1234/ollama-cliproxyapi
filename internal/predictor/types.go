@@ -37,6 +37,7 @@ const (
 	StateExhausted   = "exhausted"    // already at/under zero, waiting for reset
 	StateStable      = "stable"       // consumed before, currently zero burn
 	StateNoData      = "no-data"      // fewer than three samples in segment
+	StateNone        = "none"         // F2: capless billed balance (purchased) empty — money has no reset cycle
 )
 
 // Confidence levels (plan §6); display precision degrades with the level.

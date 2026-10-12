@@ -110,6 +110,16 @@ func buildWindowView(name string, series []WindowSample, now time.Time, profile 
 
 	switch {
 	case last.Remaining <= epsZero:
+		// F2: the capless USD window is the purchased billing channel —
+		// money has no reset cycle, so an empty balance reads neutral
+		// instead of "exhausted · waiting for reset".
+		if name == WindowPurchased {
+			view.State = StateNone
+			view.Confidence = classifyConfidence(samples, r2, true)
+			view.RatePerHour, view.OptimisticPH = cons, opt
+			view.Samples, view.R2 = samples, round2(r2)
+			return view
+		}
 		view.State = StateExhausted
 		view.Confidence = classifyConfidence(samples, r2, true)
 		view.RatePerHour, view.OptimisticPH = cons, opt
@@ -198,11 +208,22 @@ type darkGate struct {
 }
 
 // evaluateDark derives the account's dark-now state (plan §12 D-status):
-// any pct hard gate (session/weekly — D7) or the included serving window at
-// empty marks the account exhausted; a purchased balance is the billing
-// channel, never a gate. Returns the flag and the earliest reset instant
-// among the dark gates (zero when no gate carries one).
+// any pct hard gate (session/weekly — D7) at empty marks the account
+// exhausted, and so does the included serving window — unless the purchased
+// billing channel holds balance (F3/D8: the combined credits pool keeps
+// burning paid balance, and the purchased side never refills, so its
+// remaining buffer lifts included's dark mark; the pct gates are rolling
+// rate meters on their own clocks, so the buffer never lifts them).
+// Returns the flag and the earliest reset instant among the dark gates
+// (zero when no gate carries one).
 func evaluateDark(gates []darkGate) (dark bool, nextReset time.Time) {
+	purchased := -1.0 // absent reading → no buffer: stay conservative
+	for _, g := range gates {
+		if g.name == WindowPurchased {
+			purchased = g.remaining
+		}
+	}
+	epsUSD, _ := unitEps(UnitUSD)
 	for _, g := range gates {
 		if g.samples < 3 {
 			continue // below the state machine's no-data threshold
@@ -213,6 +234,9 @@ func evaluateDark(gates []darkGate) (dark bool, nextReset time.Time) {
 		}
 		if g.unit != UnitPct && g.name != WindowIncluded {
 			continue // billing channels drain to zero freely
+		}
+		if g.name == WindowIncluded && purchased > epsUSD {
+			continue // burning purchased credits, the account still serves
 		}
 		dark = true
 		if !g.resets.IsZero() && (nextReset.IsZero() || g.resets.Before(nextReset)) {

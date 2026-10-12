@@ -189,7 +189,8 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       "auth-decode-invalid": "Management Center credentials could not be decoded. Reload the Management Center and try again.",
       "auth-key-missing": "Management Center storage is present, but it does not contain a management key. Sign in again and try again.",
       "win-included": "Included balance", "win-session": "Session window", "win-weekly": "Weekly window", "win-purchased": "Purchased balance",
-      "state-exhausts-in": "exhausts in", "state-resets-first": "resets first", "state-exhausted": "exhausted", "state-stable": "stable", "state-no-data": "no data",
+      "state-exhausts-in": "exhausts in", "state-resets-first": "resets first", "state-exhausted": "exhausted", "state-stable": "stable", "state-no-data": "no data", "state-none": "none",
+      "unit-remaining": " left",
       "risk-healthy": "healthy", "risk-tight": "tight", "risk-critical": "critical",
       "conf-high": "high", "conf-medium": "medium", "conf-low": "low",
       "fleet-title": "Ollama fleet",
@@ -249,7 +250,8 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       "auth-decode-invalid": "管理中心凭据解码失败。请刷新管理中心后重试。",
       "auth-key-missing": "管理中心存储存在,但其中没有管理密钥。请重新登录后重试。",
       "win-included": "已含额度", "win-session": "会话窗口", "win-weekly": "每周窗口", "win-purchased": "已购额度",
-      "state-exhausts-in": "将耗尽", "state-resets-first": "重置在前", "state-exhausted": "已耗尽", "state-stable": "稳定", "state-no-data": "暂无数据",
+      "state-exhausts-in": "将耗尽", "state-resets-first": "重置在前", "state-exhausted": "已耗尽", "state-stable": "稳定", "state-no-data": "暂无数据", "state-none": "未使用",
+      "unit-remaining": " 剩余",
       "risk-healthy": "健康", "risk-tight": "偏紧", "risk-critical": "告急",
       "conf-high": "高", "conf-medium": "中", "conf-low": "低",
       "fleet-title": "Ollama 总额度",
@@ -439,6 +441,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     if (win.state === "stable") return t("eta-sub-stable");
     if (win.state === "exhausted") return t("eta-sub-exhausted") + (win.resets_at ? " " + new Date(win.resets_at).toLocaleString() : "");
     if (win.state === "no-data") return tf("eta-sub-no-data", {n: win.samples || 0});
+    if (win.state === "none") return ""; // F2: billed balance — nothing waits for reset
     let sub = t("eta-sub-conservative");
     if (win.optimistic_rate_per_hour && win.optimistic_rate_per_hour < win.rate_per_hour) {
       sub += tf("eta-sub-optimistic", {}) + fmtRate(win.optimistic_rate_per_hour, win.unit);
@@ -534,7 +537,8 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     const head = document.createElement("div"); head.className = "pred-row-head";
     const label = document.createElement("span"); label.className = "pred-row-label"; label.textContent = windowLabel(win.name);
     const remaining = document.createElement("span"); remaining.className = "pred-row-remaining";
-    remaining.textContent = win.unit === "pct" ? Math.round(win.remaining) + "%" : fmtMoney(win.remaining) + (win.cap ? " / " + fmtMoney(win.cap) : "");
+    const rest = win.unit === "pct" ? Math.round(win.remaining) + "%" : fmtMoney(win.remaining) + (win.cap ? " / " + fmtMoney(win.cap) : "");
+    remaining.textContent = rest + t("unit-remaining");
     head.append(label, remaining); row.appendChild(head);
     const frac = win.unit === "pct" ? win.remaining / 100 : (win.cap > 0 ? win.remaining / win.cap : 0);
     const track = document.createElement("div"); track.className = "pred-track";
