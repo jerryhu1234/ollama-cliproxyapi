@@ -20,6 +20,7 @@ type Options struct {
 	History         time.Duration // retained series span (plan 7d)
 	Horizon         time.Duration // fleet projection span (plan 48h)
 	StaleAfter      time.Duration // samples older than this are stale (plan 3×)
+	TypeKey         string        // ByType key for the provider fleet ("" → "ollama"; siblings set their own)
 	DataDir         string        // "" = memory-only persistence
 	Keys            []KeyRef
 	Fetch           FetchFn
@@ -117,6 +118,12 @@ func NewEngine(opts Options) *Engine {
 	}
 	if opts.StaleAfter <= 0 {
 		opts.StaleAfter = 3 * opts.Interval
+	}
+	if opts.TypeKey == "" {
+		// Origin provider: this package was authored for the ollama plugin,
+		// so the default fleet key stays backward compatible. Sibling
+		// plugins embedding the package set their own type key.
+		opts.TypeKey = "ollama"
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -472,6 +479,13 @@ func retryAfter(err error) (time.Duration, bool) {
 	return 0, false
 }
 
+// RetrySeconds returns the upstream Retry-After hint carried by err
+// (duration, true); false for plain errors. Exported so adapter tests can
+// pin the 429 backoff contract without reaching into the wrapper type.
+func RetrySeconds(err error) (time.Duration, bool) {
+	return retryAfter(err)
+}
+
 // RequestRefresh schedules an out-of-band observation for one key inside
 // the same token budget (plan §6 manual refresh). Non-blocking.
 func (e *Engine) RequestRefresh(keyID string) bool {
@@ -488,7 +502,7 @@ func (e *Engine) RequestRefresh(keyID string) bool {
 }
 
 // Snapshot assembles the full page/API response (plan §6): account cards
-// for every configured key plus the ollama fleet aggregate. Reads are
+// for every configured key plus the provider fleet aggregate. Reads are
 // store-only — zero upstream calls.
 func (e *Engine) Snapshot(deadline *time.Time) Response {
 	now := e.now()
@@ -503,7 +517,7 @@ func (e *Engine) Snapshot(deadline *time.Time) Response {
 		))
 	}
 	resp.ByType = map[string]FleetView{
-		"ollama": BuildFleetView(e.store, keyIDs, FleetOptions{
+		e.opts.TypeKey: BuildFleetView(e.store, keyIDs, FleetOptions{
 			Now: now, Horizon: e.opts.Horizon, StaleAfter: e.opts.StaleAfter,
 			Src: SamplingRateSource{},
 		}, deadline),
