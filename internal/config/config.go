@@ -47,6 +47,10 @@ type Predictor struct {
 	History         time.Duration
 	Horizon         time.Duration
 	DataDir         string // "" = auto-resolve; "off" = memory-only; else explicit path
+	// PeerPlugins pins the sibling plugin IDs whose /prediction endpoints
+	// the page may aggregate (plan §8 P3b,备选显式列表). Empty ⇒ page-side
+	// auto-discovery via the management plugin list.
+	PeerPlugins []string
 }
 
 type ModelPrefix struct {
@@ -138,13 +142,14 @@ type rawProtocols struct {
 // rawPredictor mirrors the predictor YAML block; pointers distinguish
 // unset (apply default) from explicit values.
 type rawPredictor struct {
-	Enabled         *bool   `yaml:"enabled"`
-	Persistence     *bool   `yaml:"persistence"`
-	SampleInterval  *string `yaml:"sample-interval"`
-	BudgetPerMinute *int    `yaml:"budget-per-minute"`
-	History         *string `yaml:"history"`
-	Horizon         *string `yaml:"horizon"`
-	DataDir         *string `yaml:"data-dir"`
+	Enabled         *bool     `yaml:"enabled"`
+	Persistence     *bool     `yaml:"persistence"`
+	SampleInterval  *string   `yaml:"sample-interval"`
+	BudgetPerMinute *int      `yaml:"budget-per-minute"`
+	History         *string   `yaml:"history"`
+	Horizon         *string   `yaml:"horizon"`
+	DataDir         *string   `yaml:"data-dir"`
+	PeerPlugins     *[]string `yaml:"peer-plugins"`
 }
 
 var (
@@ -396,7 +401,29 @@ func loadPredictor(raw *rawPredictor) (Predictor, error) {
 	if raw.DataDir != nil {
 		p.DataDir = strings.TrimSpace(*raw.DataDir)
 	}
+	if raw.PeerPlugins != nil {
+		p.PeerPlugins = normalizePeerPlugins(*raw.PeerPlugins)
+	}
 	return p, nil
+}
+
+// normalizePeerPlugins trims, drops empties and dedupes the explicit
+// sibling list, preserving first-seen order (plan §8 P3b).
+func normalizePeerPlugins(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, id := range in {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func validatePredictor(p Predictor) error {

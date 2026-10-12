@@ -41,6 +41,41 @@ func TestPredictorManagementWithoutEngine(t *testing.T) {
 	}
 }
 
+// TestPredictorPeersDecorated pins the P3b contract: configured
+// peer-plugins reach /prediction responses trimmed, deduped and
+// self-excluded, so the page's cross-type tab has a discovery fallback
+// when the management plugin list is unavailable.
+func TestPredictorPeersDecorated(t *testing.T) {
+	m := NewManager(nil)
+	yamlBytes := lifecycleRequestBody(testValidYAML +
+		"predictor:\n" +
+		"  data-dir: off\n" +
+		"  peer-plugins:\n" +
+		"    - \" ollama-cliproxyapi \"\n" +
+		"    - commandcode-go-cliproxyapi\n" +
+		"    - commandcode-go-cliproxyapi\n")
+	if _, err := m.HandleCall(pluginabi.MethodPluginRegister, yamlBytes); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.HandleCall(pluginabi.MethodPluginShutdown, []byte(`{}`)) }()
+
+	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/" + pluginName + "/prediction",
+		Body:   []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got predictor.Response
+	if err := json.Unmarshal(resp.Body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Peers) != 1 || got.Peers[0] != "commandcode-go-cliproxyapi" {
+		t.Fatalf("peers = %+v, want only the deduped, self-excluded sibling", got.Peers)
+	}
+}
+
 func TestPredictorResourceServed(t *testing.T) {
 	m := NewManager(nil)
 	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{

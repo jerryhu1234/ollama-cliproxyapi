@@ -128,6 +128,24 @@ type predictorRequest struct {
 	KeyID    string `json:"key_id,omitempty"`
 }
 
+// predictorPeers returns the configured sibling plugin IDs (plan §8 P3b),
+// self-excluded, served on /prediction responses so the page's cross-type
+// tab can fall back to an explicit list when plugin-list discovery fails.
+func (m *Manager) predictorPeers() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	peers := make([]string, 0, len(m.cfg.Predictor.PeerPlugins))
+	for _, id := range m.cfg.Predictor.PeerPlugins {
+		if id != pluginName {
+			peers = append(peers, id)
+		}
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	return peers
+}
+
 // handlePredictorManagement serves POST /v0/management/plugins/<id>/prediction.
 func (m *Manager) handlePredictorManagement(req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	var body predictorRequest
@@ -138,7 +156,7 @@ func (m *Manager) handlePredictorManagement(req pluginapi.ManagementRequest) (pl
 	}
 	pred := m.currentPredictor()
 	if pred == nil {
-		return quotaJSON(emptyPredictorResponse(time.Now().UTC()))
+		return quotaJSON(withPeers(emptyPredictorResponse(time.Now().UTC()), m.predictorPeers()))
 	}
 	if body.Refresh {
 		if !pred.RequestRefresh(body.KeyID) {
@@ -150,9 +168,15 @@ func (m *Manager) handlePredictorManagement(req pluginapi.ManagementRequest) (pl
 		if dl.IsZero() || !dl.After(time.Now()) {
 			return pluginapi.ManagementResponse{StatusCode: http.StatusBadRequest, Body: []byte(`{"error":"deadline must be a future RFC3339 timestamp"}`)}, nil
 		}
-		return quotaJSON(pred.Snapshot(&dl))
+		return quotaJSON(withPeers(pred.Snapshot(&dl), m.predictorPeers()))
 	}
-	return quotaJSON(pred.Snapshot(nil))
+	return quotaJSON(withPeers(pred.Snapshot(nil), m.predictorPeers()))
+}
+
+// withPeers decorates a snapshot with the configured peer list (plan §8 P3b).
+func withPeers(resp predictor.Response, peers []string) predictor.Response {
+	resp.Peers = peers
+	return resp
 }
 
 // emptyPredictorResponse is the disabled-engine shape: no accounts, the

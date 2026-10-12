@@ -518,12 +518,15 @@ func (e *Engine) Snapshot(deadline *time.Time) Response {
 }
 
 // Response is the prediction API payload (plan §6). Persistence is nil
-// only in the disabled-engine placeholder response.
+// only in the disabled-engine placeholder response. Peers (plan §8 P3b)
+// lists the configured sibling plugin IDs for the page's cross-type
+// discovery fallback; empty ⇒ the page auto-discovers via the plugin list.
 type Response struct {
 	GeneratedAt string               `json:"generated_at"`
 	Persistence *PersistStatus       `json:"persistence,omitempty"`
 	Accounts    []AccountView        `json:"accounts"`
 	ByType      map[string]FleetView `json:"by_type"`
+	Peers       []string             `json:"peers,omitempty"`
 }
 
 // persistCompactBytes is the steady-state compaction threshold (plan §13

@@ -107,6 +107,10 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 .pred-stale { color: var(--warning-color); }
 .pred-header { position: relative; padding-right: 76px; }
 .pred-lang { position: absolute; top: -2px; right: 0; min-width: 52px; font-weight: 600; }
+.pred-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.pred-tab { border: 1px solid var(--border-color); border-radius: 999px; padding: 7px 16px; color: var(--text-secondary); background: var(--bg-secondary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.pred-tab:hover { border-color: var(--primary-color); color: var(--text-primary); }
+.pred-tab.active { color: var(--text-primary); border-color: var(--primary-color); background: var(--bg-primary); }
 @media (max-width: 768px) {
   body { padding: 20px 16px; }
   .pred-grid { grid-template-columns: 1fr; }
@@ -121,6 +125,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     <p class="pred-description" id="pred-description">Projected balance exhaustion per credential and per window, plus fleet capacity. Reads come from the plugin's local sample store — they never consume the account API's 10 req/min budget.</p>
     <p id="pred-meta" class="pred-meta" role="status" aria-live="polite">Loading samples...</p>
   </header>
+  <nav id="pred-tabs" class="pred-tabs" role="tablist" aria-label="Prediction view" hidden></nav>
   <main id="app"><p class="pred-muted">Loading samples...</p></main>
 </div>
 <script>
@@ -150,9 +155,14 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 (() => {
   const app = document.getElementById("app");
   const metaLine = document.getElementById("pred-meta");
+  const tabNav = document.getElementById("pred-tabs");
   const endpoint = "/v0/management/plugins/ollama-cliproxyapi/prediction";
+  const pluginsListEndpoint = "/v0/management/plugins";
+  const selfID = "ollama-cliproxyapi";
+  const peerTimeoutMs = 5000; // plan §8 P3b: short-timeout sibling probes
   const storageKey = "ollama-cliproxyapi:prediction";
   const deadlineKey = "ollama-cliproxyapi:prediction-deadline";
+  const tabKey = "ollama-cliproxyapi:prediction-tab";
   const REFRESH_MS = 60 * 1000;
   /* ---- i18n (zh/en) --------------------------------------------------- */
   const langKey = "ollama-cliproxyapi:prediction-lang";
@@ -210,7 +220,12 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       "waiting-first": "Waiting for first sample… (cadence: ~10m, faster near exhaustion)",
       "sampled-at": "Sampled {t}",
       "no-window-yet": "No window data yet — the sampler reports within one interval.",
-      "resample": "Re-sample now", "queued": "Queued…"
+      "resample": "Re-sample now", "queued": "Queued…",
+      "tab-all": "All types",
+      "all-total": "All types total",
+      "all-unavailable": "{n} peer(s) unavailable",
+      "all-none": "No sibling plugin implements the prediction contract yet — showing Ollama only.",
+      "all-loading": "Querying sibling types…"
     },
     zh: {
       title: "Ollama 用量预测",
@@ -265,7 +280,12 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       "waiting-first": "等待首次采样…(节奏约 10 分钟,临耗竭时加速)",
       "sampled-at": "采样于 {t}",
       "no-window-yet": "暂无窗口数据——采样器会在一个间隔内上报。",
-      "resample": "立即采样", "queued": "已排队…"
+      "resample": "立即采样", "queued": "已排队…",
+      "tab-all": "全部类型",
+      "all-total": "跨类型合计",
+      "all-unavailable": "{n} 个端点未响应",
+      "all-none": "暂无实现预测约定的兄弟插件——当前仅显示 Ollama。",
+      "all-loading": "正在查询兄弟类型…"
     }
   };
   let lang = "en";
@@ -306,6 +326,11 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
   let lastErrorKey = "";
   let authFailStatus = "";
   let loading = false;
+  // P3b cross-type tab state: the "all types" view fans sibling plugin
+  // endpoints out from the page (plan §8) — peer data stays in memory.
+  let currentTab = "ollama";
+  let allData = null; // { items: [{peer, name, fleet}], failed: [ids], peers: [ids] }
+  let peerLoading = false;
 
   function authStatus() {
     const missing = status => ({key: "", status});
@@ -346,6 +371,31 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
         if (response.status === 400 && data && data.error) throw new Error(String(data.error).slice(0, 200));
         throw fail(response.status >= 500 ? "err-5xx" : "err-req");
       }
+      return data;
+    });
+  }
+  // Sibling/plugin-list calls use the same management key (plan §8: the
+  // Bearer credential is valid for every plugin route), with a hard 5s
+  // timeout so one hung peer cannot stall the cross-type view. 404 means
+  // "convention not implemented" and is treated as skip-by-failure.
+  function authedFetch(url, method, body) {
+    if (!authKey) return Promise.reject(new Error(authMessage("missing")));
+    const headers = {"Content-Type": "application/json", "Authorization": "Bearer " + authKey};
+    const init = {method, headers};
+    if (body !== undefined) init.body = JSON.stringify(body);
+    if (typeof AbortController !== "undefined") {
+      const ctrl = new AbortController();
+      init.signal = ctrl.signal;
+      const timer = setTimeout(() => ctrl.abort(), peerTimeoutMs);
+      return fetch(url, init).finally(() => clearTimeout(timer)).then(async response => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(String(response.status));
+        return data;
+      });
+    }
+    return fetch(url, init).then(async response => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(response.status));
       return data;
     });
   }
@@ -446,10 +496,11 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     if (sub) { const s = document.createElement("div"); s.className = "sub"; s.textContent = sub; wrap.appendChild(s); }
     return wrap;
   }
-  function renderFleet(fleet) {
+  function renderFleet(fleet, typeLabel) {
     const card = document.createElement("section"); card.className = "fleet-card";
     const head = document.createElement("div"); head.className = "fleet-head";
-    const label = document.createElement("span"); label.className = "fleet-label"; label.textContent = t("fleet-title");
+    const label = document.createElement("span"); label.className = "fleet-label";
+    label.textContent = typeLabel || t("fleet-title");
     const badge = document.createElement("span"); badge.className = "badge risk-" + (fleet.risk || "healthy"); badge.textContent = (fleet.risk && t("risk-" + fleet.risk) !== "risk-" + fleet.risk) ? t("risk-" + fleet.risk) : (fleet.risk || "");
     head.append(label, badge);
     const total = document.createElement("span"); total.className = "fleet-total";
@@ -564,6 +615,146 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       });
     }
   }
+  // ---- P3b cross-type tab (plan §8) ------------------------------------
+  // Sibling discovery prefers the management plugin list (confirmed at
+  // kickoff: GET /v0/management/plugins); the predictor.peer-plugins list
+  // configured on THIS plugin is the fallback when the list is unreachable.
+  async function discoverPeers() {
+    try {
+      const data = await authedFetch(pluginsListEndpoint, "GET");
+      const list = (data && data.plugins) || [];
+      const found = list
+        .filter(p => p && p.id && p.id !== selfID && p.effective_enabled !== false && p.registered !== false)
+        .map(p => String(p.id));
+      if (data) return found; // list reachable → discovery wins per plan
+    } catch (_) {}
+    return (lastData && lastData.peers) || []; // fallback: explicit config
+  }
+  // Fan-out: every peer gets one read-only {} POST with a 5s timeout.
+  // Single-endpoint failures never block the rest (plan §8 失败隔离); a
+  // 404 means the convention is simply not implemented there → silent skip.
+  async function loadAll() {
+    if (peerLoading) return;
+    peerLoading = true;
+    try {
+      if (!lastData) {
+        try { lastData = await request({}); saveData(lastData); }
+        catch (err) { lastErrorKey = err && err.i18nKey ? err.i18nKey : ""; lastErrorText = err.message || t("load-failed"); repaintLastError(); return; }
+      }
+      const peers = await discoverPeers();
+      const results = await Promise.all(peers.map(async id => {
+        try {
+          const data = await authedFetch("/v0/management/plugins/" + id + "/prediction", "POST", {});
+          const byType = (data && data.by_type) || {};
+          return Object.keys(byType).map(name => ({peer: id, name, fleet: byType[name]}));
+        } catch (err) {
+          return String(err && err.message) === "404" ? [] : null;
+        }
+      }));
+      allData = {
+        items: results.filter(Boolean).flat(),
+        failed: peers.filter((_, i) => results[i] === null),
+        peers
+      };
+      if (currentTab === "all") renderAll();
+    } finally { peerLoading = false; }
+  }
+  function renderAllLoading() {
+    app.textContent = "";
+    if (lastData) renderPersistBanner(lastData);
+    const p = document.createElement("p"); p.className = "pred-muted";
+    p.textContent = t("all-loading");
+    if (lastData) {
+      const fleet = lastData.by_type && lastData.by_type.ollama;
+      if (fleet) app.appendChild(renderFleet(fleet));
+    }
+    app.appendChild(p);
+  }
+  function renderAll() {
+    if (!allData) return renderAllLoading();
+    const self = lastData && lastData.by_type && lastData.by_type.ollama;
+    // Fallback: no sibling implements the contract → the P1 single-type
+    // view plus a note (plan §8 失败兜底: 永不劣化为空壳).
+    if (!allData.items.length && allData.failed.length === 0 && allData.peers.length === 0) {
+      app.textContent = "";
+      if (lastData) render(lastData); else { const p = document.createElement("p"); p.className = "pred-muted"; p.textContent = t("no-credentials"); app.appendChild(p); }
+      const note = document.createElement("p"); note.className = "pred-muted";
+      note.textContent = t("all-none");
+      app.appendChild(note);
+      return;
+    }
+    app.textContent = "";
+    if (lastData) renderPersistBanner(lastData);
+    const types = [];
+    if (self) types.push({peer: selfID, name: "ollama", fleet: self});
+    allData.items.forEach(it => types.push(it));
+    if (types.length === 0) {
+      // Only unreachable siblings: degrade to the single view + the
+      // unavailable note rather than a hollow totals card.
+      const note = document.createElement("p"); note.className = "pred-muted";
+      note.textContent = tf("all-unavailable", {n: allData.failed.length}) + ": " + allData.failed.join(", ");
+      if (lastData) render(lastData); else { const p = document.createElement("p"); p.className = "pred-muted"; p.textContent = t("no-credentials"); app.appendChild(p); }
+      app.appendChild(note);
+      return;
+    }
+    // Light cross-type totals (plan §8: 总剩余 / 总速率 — no projection).
+    let rem = 0, cap = 0, rate = 0, act = 0, conf = 0;
+    types.forEach(ty => {
+      const f = ty.fleet || {};
+      rem += Number(f.remaining_usd) || 0;
+      cap += Number(f.cap_usd) || 0;
+      rate += Number(f.rate_per_hour) || 0;
+      act += Number(f.active_accounts) || 0;
+      conf += Number(f.total_accounts) || 0;
+    });
+    const total = document.createElement("section"); total.className = "fleet-card";
+    const head = document.createElement("div"); head.className = "fleet-head";
+    const label = document.createElement("span"); label.className = "fleet-label"; label.textContent = t("all-total");
+    const totalEl = document.createElement("span"); totalEl.className = "fleet-total";
+    totalEl.textContent = fmtMoney(rem) + (cap > 0 ? " / " + fmtMoney(cap) : "");
+    head.append(label, totalEl);
+    total.appendChild(head);
+    const grid = document.createElement("div"); grid.className = "fleet-grid";
+    grid.appendChild(fleetStat(t("fleet-rate"), rate > 0 ? "$" + rate.toFixed(3) + "/h" : "—"));
+    grid.appendChild(fleetStat(t("fleet-accounts"), String(act), tf("fleet-accounts-sub", {n: conf, m: 0})));
+    if (allData.failed.length) {
+      grid.appendChild(fleetStat(tf("all-unavailable", {n: allData.failed.length}), String(allData.failed.length), allData.failed.join(", ")));
+    }
+    total.appendChild(grid);
+    app.appendChild(total);
+    types.forEach(ty => {
+      app.appendChild(renderFleet(ty.fleet, ty.name));
+    });
+  }
+  function setTabsVis() { if (tabNav) tabNav.hidden = !authKey; }
+  function buildTabs() {
+    if (!tabNav) return;
+    tabNav.innerHTML = "";
+    const own = document.createElement("button");
+    own.type = "button"; own.className = "pred-tab"; own.dataset.tab = "ollama";
+    own.textContent = "Ollama";
+    const all = document.createElement("button");
+    all.type = "button"; all.className = "pred-tab"; all.dataset.tab = "all";
+    all.textContent = t("tab-all");
+    own.onclick = () => switchTab("ollama");
+    all.onclick = () => switchTab("all");
+    tabNav.append(own, all);
+    [...tabNav.children].forEach(b => {
+      b.classList.toggle("active", b.dataset.tab === currentTab);
+    });
+    setTabsVis();
+  }
+  function switchTab(tab) {
+    if (tab !== "ollama" && tab !== "all") tab = "ollama";
+    currentTab = tab;
+    try { localStorage.setItem(tabKey, tab); } catch (_) {}
+    if (tabNav) [...tabNav.children].forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+    if (tab === "all") {
+      if (allData) renderAll();
+      else { renderAllLoading(); loadAll(); }
+    } else if (lastData) render(lastData);
+    else paintCache();
+  }
   // D10: persistence degradation is visible, not silent.
   function renderPersistBanner(data) {
     const st = data.persistence;
@@ -612,9 +803,11 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     const title = document.getElementById("pred-title");
     const description = document.getElementById("pred-description");
     const toggle = document.getElementById("pred-lang");
+    const allTab = tabNav && tabNav.querySelector('[data-tab="all"]');
     if (title) title.textContent = t("title");
     if (description) description.textContent = t("description");
     if (toggle) toggle.textContent = lang === "zh" ? "EN" : "中文";
+    if (allTab) allTab.textContent = t("tab-all");
     if (metaLine && !lastData) {
       metaLine.textContent = authFailStatus || lastErrorText ? "" : t("loading");
     }
@@ -625,7 +818,10 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     try { localStorage.setItem(langKey, lang); } catch (_) {}
     document.title = t("title");
     applyI18nStatic();
-    if (lastData) render(lastData);
+    if (currentTab === "all") {
+      if (allData) renderAll();
+      else if (lastData) renderAllLoading();
+    } else if (lastData) render(lastData);
     else if (authFailStatus) renderAuthFailure(authFailStatus);
     else if (lastErrorText) repaintLastError();
     else paintCache();
@@ -637,7 +833,13 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       const data = await request({});
       lastData = data;
       saveData(data);
-      render(data);
+      // The cross-type tab paints from loadAll(); an own-snapshot refresh
+      // only feeds it — switching views mid-flight stays coherent.
+      if (currentTab === "all") {
+        if (allData) renderAll();
+      } else {
+        render(data);
+      }
     } catch (err) {
       lastErrorKey = err && err.i18nKey ? err.i18nKey : "";
       lastErrorText = err.message || t("load-failed");
@@ -654,24 +856,27 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     };
   }
   applyI18nStatic();
+  // P3b: restore the last selected view; the "all types" tab paints a
+  // loading shell immediately, then fans sibling endpoints out.
+  try {
+    const savedTab = localStorage.getItem(tabKey);
+    if (savedTab === "all") currentTab = "all";
+  } catch (_) {}
   const initialAuth = authStatus();
-  if (initialAuth.key) {
-    authKey = initialAuth.key;
-    paintCache();
-    load();
-    setInterval(load, REFRESH_MS);
-  } else {
-    const retryAuth = initialAuth.status === "storage-blocked" ? authStatus() : initialAuth;
-    if (!retryAuth.key) {
-      authFailStatus = retryAuth.status;
-      renderAuthFailure(authFailStatus);
-      applyI18nStatic();
-      return;
-    }
+  const retryAuth = initialAuth.key ? initialAuth
+    : (initialAuth.status === "storage-blocked" ? authStatus() : initialAuth);
+  if (retryAuth.key) {
     authKey = retryAuth.key;
+    buildTabs();
     paintCache();
-    load();
-    setInterval(load, REFRESH_MS);
+    const tick = currentTab === "all" ? loadAll : load;
+    if (currentTab === "all") renderAllLoading();
+    tick();
+    setInterval(tick, REFRESH_MS);
+  } else {
+    authFailStatus = retryAuth.status;
+    renderAuthFailure(authFailStatus);
+    applyI18nStatic();
   }
 })();
 </script>
