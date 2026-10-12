@@ -26,7 +26,28 @@ const (
 	DefaultStreamFinishGrace      = 15 * time.Second
 	DefaultMaxResponseBytes       = int64(67108864) // 64 MiB
 	DefaultResponsesCompatibility = "cpa"
+
+	// Usage predictor defaults (docs/usage-prediction-plan.md §7).
+	DefaultPredictorSampleInterval = 10 * time.Minute
+	DefaultPredictorBudget         = 8 // account-API calls per minute, global
+	DefaultPredictorHistory        = 7 * 24 * time.Hour
+	DefaultPredictorHorizon        = 48 * time.Hour
+	PredictorDataDirOff            = "off" // explicit memory-only marker
+	DefaultPredictorDataDirSuffix  = ".cli-proxy-api/usage-predictor"
 )
+
+// Predictor configures the usage prediction sampler (plan §7): period
+// balance/usage sampling into a local time-series store, from which the
+// prediction page reads — never the upstream account API directly.
+type Predictor struct {
+	Enabled         bool
+	Persistence     bool
+	SampleInterval  time.Duration
+	BudgetPerMinute int
+	History         time.Duration
+	Horizon         time.Duration
+	DataDir         string // "" = auto-resolve; "off" = memory-only; else explicit path
+}
 
 type ModelPrefix struct {
 	Enabled bool
@@ -60,6 +81,7 @@ type Config struct {
 	APIKeys                []APIKey
 	Catalog                Catalog
 	Protocols              Protocols
+	Predictor              Predictor
 	RouteOverrides         map[string]RouteOverride
 	AllowHTTP              bool
 	RequestTimeout         time.Duration
@@ -81,6 +103,7 @@ type rawConfig struct {
 	APIKeys                []rawKey                 `yaml:"api-keys"`
 	Catalog                rawCatalog               `yaml:"catalog"`
 	Protocols              rawProtocols             `yaml:"protocols"`
+	Predictor              rawPredictor             `yaml:"predictor"`
 	RouteOverrides         map[string]RouteOverride `yaml:"route-overrides"`
 	AllowHTTP              bool                     `yaml:"allow-http"`
 	RequestTimeout         *string                  `yaml:"request-timeout"`
@@ -110,6 +133,18 @@ type rawProtocols struct {
 	ChatCompletions *bool `yaml:"chat-completions"`
 	Messages        *bool `yaml:"messages"`
 	Responses       *bool `yaml:"responses"`
+}
+
+// rawPredictor mirrors the predictor YAML block; pointers distinguish
+// unset (apply default) from explicit values.
+type rawPredictor struct {
+	Enabled         *bool   `yaml:"enabled"`
+	Persistence     *bool   `yaml:"persistence"`
+	SampleInterval  *string `yaml:"sample-interval"`
+	BudgetPerMinute *int    `yaml:"budget-per-minute"`
+	History         *string `yaml:"history"`
+	Horizon         *string `yaml:"horizon"`
+	DataDir         *string `yaml:"data-dir"`
 }
 
 var (
@@ -180,6 +215,10 @@ func Load(yamlBytes []byte) (Config, error) {
 	if streamFinishGrace > streamIdleTimeout {
 		return Config{}, fmt.Errorf("stream-finish-grace: must not exceed stream-idle-timeout")
 	}
+	predictorCfg, err := loadPredictor(&raw.Predictor)
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
 		BaseURL: orDefault(raw.BaseURL, DefaultBaseURL),
 		ModelPrefix: ModelPrefix{
@@ -196,6 +235,7 @@ func Load(yamlBytes []byte) (Config, error) {
 			Messages:        orDefault(raw.Protocols.Messages, true),
 			Responses:       orDefault(raw.Protocols.Responses, true),
 		},
+		Predictor:              predictorCfg,
 		RouteOverrides:         raw.RouteOverrides,
 		AllowHTTP:              raw.AllowHTTP,
 		RequestTimeout:         requestTimeout,
@@ -212,7 +252,10 @@ func Load(yamlBytes []byte) (Config, error) {
 		c.CatalogURL = strings.TrimRight(*raw.CatalogURL, "/")
 	} else {
 		// Ollama serves the OpenAI-compatible catalog at {base}/v1/models.
-		c.CatalogURL = strings.TrimRight(c.BaseURL, "/") + "/v1/models"
+		// A base pasted from the OpenAI surface already ends in /v1 — trim
+		// it first (same normalization as AccountAPIBase) so the derived
+		// URL never doubles the segment.
+		c.CatalogURL = strings.TrimSuffix(strings.TrimRight(c.BaseURL, "/"), "/v1") + "/v1/models"
 	}
 	if err := c.validate(); err != nil {
 		return Config{}, err
@@ -229,6 +272,9 @@ func PublicID(c Config, upstreamID string) string {
 }
 
 func (c Config) validate() error {
+	if err := validatePredictor(c.Predictor); err != nil {
+		return err
+	}
 	if err := validateURL("base-url", c.BaseURL, c.AllowHTTP); err != nil {
 		return err
 	}
@@ -321,6 +367,58 @@ func validPrefix(s string) bool {
 		}
 	}
 	return true
+}
+
+// loadPredictor applies the predictor block defaults (plan §7: enabled +
+// persistence on, 10m sampling, 8/min budget, 7d history, 48h horizon,
+// auto data-dir unless explicitly "off").
+func loadPredictor(raw *rawPredictor) (Predictor, error) {
+	sampleInterval, err := parseDuration("predictor.sample-interval", raw.SampleInterval, DefaultPredictorSampleInterval)
+	if err != nil {
+		return Predictor{}, err
+	}
+	history, err := parseDuration("predictor.history", raw.History, DefaultPredictorHistory)
+	if err != nil {
+		return Predictor{}, err
+	}
+	horizon, err := parseDuration("predictor.horizon", raw.Horizon, DefaultPredictorHorizon)
+	if err != nil {
+		return Predictor{}, err
+	}
+	p := Predictor{
+		Enabled:         orDefault(raw.Enabled, true),
+		Persistence:     orDefault(raw.Persistence, true),
+		SampleInterval:  sampleInterval,
+		BudgetPerMinute: orDefault(raw.BudgetPerMinute, DefaultPredictorBudget),
+		History:         history,
+		Horizon:         horizon,
+	}
+	if raw.DataDir != nil {
+		p.DataDir = strings.TrimSpace(*raw.DataDir)
+	}
+	return p, nil
+}
+
+func validatePredictor(p Predictor) error {
+	if !p.Enabled {
+		return nil
+	}
+	if p.SampleInterval < 2*time.Minute {
+		return fmt.Errorf("predictor.sample-interval: must be at least 2m")
+	}
+	if p.BudgetPerMinute < 1 || p.BudgetPerMinute > 10 {
+		return fmt.Errorf("predictor.budget-per-minute: must be 1..10 (account API allows 10/min per user)")
+	}
+	if p.History < 24*time.Hour {
+		return fmt.Errorf("predictor.history: must be at least 24h")
+	}
+	if p.Horizon < time.Hour {
+		return fmt.Errorf("predictor.horizon: must be at least 1h")
+	}
+	if p.Horizon > p.History {
+		return fmt.Errorf("predictor.horizon: must not exceed predictor.history")
+	}
+	return nil
 }
 
 func parseDuration(name string, p *string, def time.Duration) (time.Duration, error) {

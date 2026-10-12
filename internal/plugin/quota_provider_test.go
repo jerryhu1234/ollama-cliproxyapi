@@ -36,7 +36,7 @@ func quotaProviderFixture(t *testing.T) (*Manager, *fakeCaller) {
 		switch {
 		case strings.HasSuffix(req.URL, "/api/balance"):
 			body = `{"included":{"balance_usd":72.5,"allowance_usd":100,"period":{"from":"2026-10-01T00:00:00Z","until":"2026-10-31T00:00:00Z"}},"purchased":{"balance_usd":25}}`
-		case strings.HasPrefix(req.URL, accountUsagePath+"?"):
+		case strings.Contains(req.URL, accountUsagePath+"?"):
 			body = `{"range":"24h","scope":"self","granularity":"hour","totals":{"request_count":3,"usage_usd":1.2,"input_tokens":100,"cached_input_tokens":0,"output_tokens":200}}`
 		default:
 			t.Fatalf("unexpected quota URL %q", req.URL)
@@ -93,8 +93,10 @@ func TestQuotaProviderDispatchAndCredentialContext(t *testing.T) {
 	}
 	var got pluginapi.QuotaFetchResponse
 	decodeResult(t, raw, &got)
-	// Currency summary metrics: balance + purchased balance + the text usage line.
-	if len(got.Summary) != 3 {
+	// Currency summary metrics (native) plus one text line per page row
+	// fact and the 24h usage totals: balance_usd, purchased_balance_usd,
+	// balance, purchased_balance, usage_24h.
+	if len(got.Summary) != 5 {
 		t.Fatalf("summary = %+v", got.Summary)
 	}
 	if got.Summary[0].Key != "balance_usd" || got.Summary[0].Format != "currency" || math.Abs(got.Summary[0].Value-72.5) > 1e-9 {
@@ -103,11 +105,20 @@ func TestQuotaProviderDispatchAndCredentialContext(t *testing.T) {
 	if got.Summary[1].Key != "purchased_balance_usd" || math.Abs(got.Summary[1].Value-25) > 1e-9 {
 		t.Fatalf("purchased metric = %+v", got.Summary[1])
 	}
+	if got.Summary[2].Key != "balance" || got.Summary[2].Label != "Balance: $72.50 included" {
+		t.Fatalf("balance text metric = %+v", got.Summary[2])
+	}
+	if got.Summary[3].Key != "purchased_balance" || got.Summary[3].Label != "Purchased balance: $25.00" {
+		t.Fatalf("purchased text metric = %+v", got.Summary[3])
+	}
+	if got.Summary[4].Key != "usage_24h" || got.Summary[4].Label != "Usage (24h): 3 requests · $1.20 · 100 in / 200 out" {
+		t.Fatalf("usage text metric = %+v", got.Summary[4])
+	}
 	if len(got.Groups) != 1 || len(got.Groups[0].Buckets) != 1 {
 		t.Fatalf("groups = %+v", got.Groups)
 	}
-	// included: 72.5 of 100 USD → 0.275 remaining.
-	if fraction := got.Groups[0].Buckets[0].RemainingFraction; math.Abs(fraction-0.275) > 1e-9 {
+	// included: 72.5 of 100 USD left → remaining fraction 0.725.
+	if fraction := got.Groups[0].Buckets[0].RemainingFraction; math.Abs(fraction-0.725) > 1e-9 {
 		t.Fatalf("included remaining fraction = %v", fraction)
 	}
 	if got.Groups[0].Buckets[0].ResetTime != "2026-10-31T00:00:00Z" {

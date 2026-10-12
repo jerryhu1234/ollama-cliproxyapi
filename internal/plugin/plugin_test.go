@@ -457,7 +457,7 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	if wire["method"] != http.MethodGet {
 		t.Fatalf("bridged method = %v, want GET", wire["method"])
 	}
-	if wire["url"] != "https://api.commandcode.ai/v1/models" {
+	if wire["url"] != "https://ollama.com/v1/models" {
 		t.Fatalf("bridged url = %v", wire["url"])
 	}
 	headers := wire["headers"].(map[string]any)
@@ -518,7 +518,7 @@ func TestLifecycleMaterializesDeterministicAuthRecords(t *testing.T) {
 		}
 		hash := sha256.Sum256([]byte(record.APIKey))
 		wantHash := hex.EncodeToString(hash[:])
-		if record.Type != ProviderID || record.ID != "ollama-key-"+wantHash || record.Label != "CommandCode credential "+wantHash || wire.Name != record.ID+".json" {
+		if record.Type != ProviderID || record.ID != "ollama-key-"+wantHash || record.Label != "Ollama credential "+wantHash || wire.Name != record.ID+".json" {
 			t.Fatalf("record identity = %+v name=%q", record, wire.Name)
 		}
 		if record.APIKey == "" || strings.Contains(wire.Name, record.APIKey) || strings.Contains(record.ID, record.APIKey) {
@@ -1097,8 +1097,8 @@ func TestShutdownAbortsInFlightTickRefresh(t *testing.T) {
 // failure and the next success, and background ticks fetch the NEW
 // catalog-url instead of the old one forever.
 func TestReconfigureFailedRefreshSeedsCarryoverThenFetchesNewURL(t *testing.T) {
-	oldURL := "https://api.commandcode.ai/v1/models"
-	newURL := "https://mirror.test/api/models"
+	oldURL := "https://ollama.com/v1/models"
+	newURL := "https://mirror.test/api/v1/models"
 	catalogV1 := `{"data":[{"id":"glm-5.3"}]}`
 	catalogV2 := `{"data":[{"id":"minimax-m3"}]}`
 	var allowOldURL atomic.Bool

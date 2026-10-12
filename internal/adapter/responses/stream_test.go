@@ -413,7 +413,7 @@ func TestOpenAICompletedStopNoTools(t *testing.T) {
 		t.Fatalf("events=%d", len(events))
 	}
 	start := payloadOf(t, events[0])
-	if start["id"] != "commandcode" { // default identity when created carries no response object
+	if start["id"] != "ollama" { // default identity when created carries no response object
 		t.Errorf("default id = %v", start["id"])
 	}
 	// Upstream omitted created_at: the shared chunk kernel defaults to
@@ -761,7 +761,7 @@ func TestClaudeIncompleteMaxTokens(t *testing.T) {
 		t.Fatalf("done=%v err=%v", done, eErr)
 	}
 	msg := messageStart(t, events)
-	if msg["id"] != "commandcode" { // default identity preserved
+	if msg["id"] != "ollama" { // default identity preserved
 		t.Errorf("default id = %v", msg["id"])
 	}
 	md := payloadOf(t, events[len(events)-2])

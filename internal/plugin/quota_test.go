@@ -21,11 +21,23 @@ func TestManagementRegistration(t *testing.T) {
 		Resources []struct{ Path, Menu, Description string } `json:"resources"`
 	}
 	decodeResult(t, mustHandle(t, m, pluginabi.MethodManagementRegister, []byte(`{}`)), &got)
-	if len(got.Routes) != 1 || got.Routes[0].Method != http.MethodPost || got.Routes[0].Path != "/plugins/"+pluginName+"/quota-usage" {
+	if len(got.Routes) != 2 {
 		t.Fatalf("routes = %+v", got.Routes)
 	}
-	if len(got.Resources) != 1 || got.Resources[0].Path != "/quota" || got.Resources[0].Menu != "Ollama Quota" {
+	if got.Routes[0].Method != http.MethodPost || got.Routes[0].Path != "/plugins/"+pluginName+"/quota-usage" {
+		t.Fatalf("route[0] = %+v", got.Routes[0])
+	}
+	if got.Routes[1].Method != http.MethodPost || got.Routes[1].Path != "/plugins/"+pluginName+"/prediction" {
+		t.Fatalf("route[1] = %+v", got.Routes[1])
+	}
+	if len(got.Resources) != 2 {
 		t.Fatalf("resources = %+v", got.Resources)
+	}
+	if got.Resources[0].Path != "/quota" || got.Resources[0].Menu != "Ollama Quota" {
+		t.Fatalf("resource[0] = %+v", got.Resources[0])
+	}
+	if got.Resources[1].Path != "/prediction" || got.Resources[1].Menu != "Ollama Usage Prediction" {
+		t.Fatalf("resource[1] = %+v", got.Resources[1])
 	}
 	var registration registrationResult
 	decodeResult(t, mustHandle(t, m, pluginabi.MethodPluginRegister, lifecycleRequestBody(testValidYAML)), &registration)
@@ -249,13 +261,13 @@ func TestPeriodRFC3339(t *testing.T) {
 
 func TestAccountAPIBase(t *testing.T) {
 	cases := map[string]string{
-		"https://ollama.com":            "https://ollama.com",
-		"https://ollama.com/":           "https://ollama.com",
-		"https://ollama.com/v1":         "https://ollama.com",
-		"https://mirror.test/v1/":       "https://mirror.test",
-		"https://proxy.test/ollama/v1":  "https://proxy.test/ollama",
-		"http://localhost:11434":        "http://localhost:11434",
-		"http://127.0.0.1:11434":        "http://127.0.0.1:11434",
+		"https://ollama.com":           "https://ollama.com",
+		"https://ollama.com/":          "https://ollama.com",
+		"https://ollama.com/v1":        "https://ollama.com",
+		"https://mirror.test/v1/":      "https://mirror.test",
+		"https://proxy.test/ollama/v1": "https://proxy.test/ollama",
+		"http://localhost:11434":       "http://localhost:11434",
+		"http://127.0.0.1:11434":       "http://127.0.0.1:11434",
 	}
 	for in, want := range cases {
 		got, err := AccountAPIBase(in)
@@ -272,12 +284,12 @@ func TestAccountAPIBase(t *testing.T) {
 
 func TestLocalBaseURL(t *testing.T) {
 	cases := map[string]bool{
-		"http://localhost:11434":       true,
-		"http://127.0.0.1:11434":       true,
-		"http://box.localhost:11434":   true,
-		"https://ollama.com":           false,
-		"https://api.example.test":     false,
-		"http://localhost.evil.com":    false,
+		"http://localhost:11434":     true,
+		"http://127.0.0.1:11434":     true,
+		"http://box.localhost:11434": true,
+		"https://ollama.com":         false,
+		"https://api.example.test":   false,
+		"http://localhost.evil.com":  false,
 	}
 	for in, want := range cases {
 		if got := localBaseURL(in); got != want {

@@ -123,11 +123,24 @@ type usageTotals struct {
 	OutputTokens      int64   `json:"output_tokens"`
 }
 
+// usageBucket is one hourly consumption bucket from the 24h range: the
+// shape input for the predictor's diurnal burn profile. The trailing
+// bucket may be partial and systematically under-counts upstream ("new
+// usage may take time to appear").
+type usageBucket struct {
+	From         string  `json:"from"`
+	Until        string  `json:"until,omitempty"`
+	UsageUSD     float64 `json:"usage_usd"`
+	RequestCount int64   `json:"request_count,omitempty"`
+	Partial      bool    `json:"partial,omitempty"`
+}
+
 type usageResponse struct {
-	Range       string      `json:"range"`
-	Scope       string      `json:"scope"`
-	Granularity string      `json:"granularity"`
-	Totals      usageTotals `json:"totals"`
+	Range       string        `json:"range"`
+	Scope       string        `json:"scope"`
+	Granularity string        `json:"granularity"`
+	Totals      usageTotals   `json:"totals"`
+	Buckets     []usageBucket `json:"buckets,omitempty"`
 }
 
 // quotaIdentity returns the stable per-key card identity: the same
@@ -140,6 +153,12 @@ func quotaIdentity(key string) (id, label string) {
 func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	if req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginName+"/quota" {
 		return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}}, Body: []byte(resources.QuotaPage)}, nil
+	}
+	if req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginName+"/prediction" {
+		return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}}, Body: []byte(resources.PredictionPage)}, nil
+	}
+	if req.Method == http.MethodPost && req.Path == "/v0/management/plugins/"+pluginName+"/prediction" {
+		return m.handlePredictorManagement(req)
 	}
 	if req.Method != http.MethodPost || req.Path != "/v0/management/plugins/"+pluginName+"/quota-usage" {
 		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Body: []byte(`{"error":"not found"}`)}, nil

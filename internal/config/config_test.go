@@ -25,13 +25,13 @@ func TestLoadMinimalAppliesAllDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(minimal) failed: %v", err)
 	}
-	if c.BaseURL != "https://api.commandcode.ai/provider/v1" {
+	if c.BaseURL != "https://ollama.com" {
 		t.Errorf("BaseURL = %q", c.BaseURL)
 	}
-	if c.CatalogURL != "https://api.commandcode.ai/provider/v1/models" {
+	if c.CatalogURL != "https://ollama.com/v1/models" {
 		t.Errorf("CatalogURL = %q", c.CatalogURL)
 	}
-	if !c.ModelPrefix.Enabled || c.ModelPrefix.Value != "commandcode" {
+	if !c.ModelPrefix.Enabled || c.ModelPrefix.Value != "ollama" {
 		t.Errorf("ModelPrefix = %+v", c.ModelPrefix)
 	}
 	if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "sk-dummy" {
@@ -243,7 +243,7 @@ func TestLoadDerivedCatalogURLFromCustomBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if c.CatalogURL != "https://upstream.example.com/api/models" {
+	if c.CatalogURL != "https://upstream.example.com/api/v1/models" {
 		t.Errorf("CatalogURL = %q", c.CatalogURL)
 	}
 }
@@ -254,7 +254,7 @@ func TestLoadDerivedCatalogURLTrimsTrailingSlash(t *testing.T) {
 		t.Fatalf("Load failed: %v", err)
 	}
 	if c.CatalogURL != "https://api.commandcode.ai/provider/v1/models" {
-		t.Errorf("CatalogURL = %q, want no double slash", c.CatalogURL)
+		t.Errorf("CatalogURL = %q, want no double v1", c.CatalogURL)
 	}
 }
 
@@ -429,5 +429,91 @@ func TestValidateURLRejectsQueryFragmentUserinfo(t *testing.T) {
 				t.Errorf("error echoes credentials: %q", err.Error())
 			}
 		})
+	}
+}
+
+// ---- usage predictor (docs/usage-prediction-plan.md §7) --------------------
+
+func TestPredictorDefaults(t *testing.T) {
+	c, err := Load([]byte(withKey))
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	p := c.Predictor
+	if !p.Enabled {
+		t.Errorf("Enabled = false, want default-on (plan D1)")
+	}
+	if !p.Persistence {
+		t.Errorf("Persistence = false, want default-on (plan D1)")
+	}
+	if p.SampleInterval != 10*time.Minute {
+		t.Errorf("SampleInterval = %v", p.SampleInterval)
+	}
+	if p.BudgetPerMinute != 8 {
+		t.Errorf("BudgetPerMinute = %d", p.BudgetPerMinute)
+	}
+	if p.History != 7*24*time.Hour {
+		t.Errorf("History = %v", p.History)
+	}
+	if p.Horizon != 48*time.Hour {
+		t.Errorf("Horizon = %v", p.Horizon)
+	}
+	if p.DataDir != "" {
+		t.Errorf("DataDir = %q, want empty = auto-resolve", p.DataDir)
+	}
+}
+
+func TestPredictorOverrides(t *testing.T) {
+	doc := withKey + `
+predictor:
+  enabled: false
+  persistence: false
+  sample-interval: 5m
+  budget-per-minute: 3
+  history: 48h
+  horizon: 24h
+  data-dir: /tmp/pred-test
+`
+	c, err := Load([]byte(doc))
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	p := c.Predictor
+	if p.Enabled || p.Persistence {
+		t.Errorf("enabled/persistence = %+v", p)
+	}
+	if p.SampleInterval != 5*time.Minute || p.BudgetPerMinute != 3 || p.History != 48*time.Hour || p.Horizon != 24*time.Hour {
+		t.Errorf("numeric overrides = %+v", p)
+	}
+	if p.DataDir != "/tmp/pred-test" {
+		t.Errorf("DataDir = %q", p.DataDir)
+	}
+}
+
+func TestPredictorValidation(t *testing.T) {
+	cases := []struct {
+		name, block, want string
+	}{
+		{"interval below floor", "predictor:\n  sample-interval: 1m\n", "sample-interval"},
+		{"budget below range", "predictor:\n  budget-per-minute: 0\n", "budget-per-minute"},
+		{"budget above range", "predictor:\n  budget-per-minute: 11\n", "budget-per-minute"},
+		{"history below range", "predictor:\n  history: 12h\n", "history"},
+		{"horizon below range", "predictor:\n  horizon: 30m\n", "horizon"},
+		{"horizon exceeds history", "predictor:\n  horizon: 336h\n", "horizon"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte(withKey + tc.block))
+			requireErrContains(t, err, tc.want)
+		})
+	}
+	// Disabled predictor skips the sanity checks entirely.
+	if _, err := Load([]byte(withKey + "predictor:\n  enabled: false\n  sample-interval: 1s\n")); err != nil {
+		t.Fatalf("disabled predictor must not validate: %v", err)
+	}
+	// The explicit memory-only marker is legal.
+	c, err := Load([]byte(withKey + "predictor:\n  data-dir: off\n"))
+	if err != nil || c.Predictor.DataDir != "off" {
+		t.Fatalf("data-dir off: %+v %v", c.Predictor, err)
 	}
 }

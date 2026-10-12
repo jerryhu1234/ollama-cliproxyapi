@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"ollama-cliproxyapi/internal/adapter/shared"
 	"ollama-cliproxyapi/internal/errclass"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func decodeOut(t *testing.T, out []byte, eErr *errclass.Error) map[string]any {

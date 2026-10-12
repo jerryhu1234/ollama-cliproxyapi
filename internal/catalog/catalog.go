@@ -436,10 +436,26 @@ func JoinUpstreamURL(baseURL, endpoint string) string {
 // JoinUpstreamURL would send the request to a different authority or scheme
 // than the configured base-url. Any parse failure counts as escaping (fail
 // closed).
+//
+// Authority-rewrite defense (spec 05 §2): against a bare-host base the
+// endpoint's first segment is authority-adjacent, so a "user@host"-shaped
+// segment ("/v1@evil.com/x") must be rejected outright — any consumer that
+// later re-parses the URL string would land on the rewritten authority. With
+// a pathed base the "@" always sits mid-path and net/url keeps the base
+// authority, so it stays routable.
 func endpointEscapesBase(baseURL, endpoint string) bool {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return true
+	}
+	if base.Path == "" || base.Path == "/" {
+		seg := strings.TrimPrefix(endpoint, "/")
+		if i := strings.IndexByte(seg, '/'); i >= 0 {
+			seg = seg[:i]
+		}
+		if strings.Contains(seg, "@") {
+			return true
+		}
 	}
 	got, err := url.Parse(JoinUpstreamURL(baseURL, endpoint))
 	if err != nil {

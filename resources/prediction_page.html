@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ollama Usage Prediction</title>
+<style>
+:root {
+  --bg-primary: #f0eee8;
+  --bg-secondary: #faf9f5;
+  --bg-tertiary: #e9e6df;
+  --text-primary: #2d2a26;
+  --text-secondary: #6d6760;
+  --text-tertiary: #a29c95;
+  --border-color: #e3e1db;
+  --primary-color: #8b8680;
+  --primary-hover: #7f7a74;
+  --success-color: #188038;
+  --warning-color: #b06000;
+  --error-color: #b3261e;
+  --radius-md: 8px;
+  --shadow: 0 1px 3px rgba(45, 42, 38, .12);
+}
+[data-theme="white"] {
+  --bg-primary: #f0eee8;
+  --bg-secondary: #faf9f5;
+  --bg-tertiary: #e9e6df;
+  --text-primary: #2d2a26;
+  --text-secondary: #6d6760;
+  --text-tertiary: #a29c95;
+  --border-color: #e3e1db;
+}
+[data-theme="dark"] {
+  --bg-primary: #1d1b18;
+  --bg-secondary: #151412;
+  --bg-tertiary: #262320;
+  --text-primary: #f0eee8;
+  --text-secondary: #b8b1a8;
+  --text-tertiary: #8d867e;
+  --border-color: #3c3833;
+  --primary-color: #8f8981;
+  --primary-hover: #a29b92;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .35);
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--bg-secondary); font: 14px/1.45 system-ui, sans-serif; }
+.pred-page { max-width: 1160px; margin: 0 auto; }
+.pred-header { margin-bottom: 24px; }
+.pred-title { margin: 0; font-size: 28px; font-weight: 700; line-height: 1.2; }
+.pred-description { margin: 8px 0 0; color: var(--text-secondary); }
+.pred-meta { margin: 10px 0 0; color: var(--text-secondary); font-size: 13px; }
+.pred-meta strong { color: var(--text-primary); }
+.pred-banner { display: flex; align-items: baseline; gap: 8px; margin: 12px 0 0; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--warning-color) 45%, transparent); border-radius: var(--radius-md); background: color-mix(in srgb, var(--warning-color) 10%, transparent); color: var(--warning-color); font-size: 13px; }
+.pred-banner .pred-banner-tag { font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; white-space: nowrap; }
+.pred-banner .pred-banner-detail { color: var(--text-secondary); overflow-wrap: anywhere; }
+.fleet-card { padding: 20px; margin-bottom: 16px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-primary); box-shadow: var(--shadow); }
+.fleet-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 20px; }
+.fleet-label { font-size: 15px; font-weight: 700; }
+.fleet-total { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.fleet-sub { color: var(--text-secondary); font-size: 12px; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.badge.risk-healthy { color: var(--success-color); background: color-mix(in srgb, var(--success-color) 12%, transparent); }
+.badge.risk-tight { color: var(--warning-color); background: color-mix(in srgb, var(--warning-color) 14%, transparent); }
+.badge.risk-critical { color: var(--error-color); background: color-mix(in srgb, var(--error-color) 12%, transparent); }
+.badge.conf-high { color: var(--success-color); }
+.badge.conf-medium { color: var(--warning-color); }
+.badge.conf-low { color: var(--text-tertiary); }
+.badge.state-exhausts-in { color: var(--warning-color); }
+.badge.state-resets-first { color: var(--primary-color); }
+.badge.state-exhausted { color: var(--error-color); }
+.badge.state-stable { color: var(--success-color); }
+.badge.state-no-data { color: var(--text-tertiary); }
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; margin: 14px 0; }
+.fleet-stat .k { color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.fleet-stat .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fleet-stat .sub { color: var(--text-secondary); font-size: 11px; }
+.projection { width: 100%; height: 96px; display: block; margin-top: 6px; }
+.deadline-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+.deadline-row label { color: var(--text-secondary); font-size: 12px; }
+.deadline-row input { border: 1px solid var(--border-color); border-radius: 8px; padding: 7px 9px; color: var(--text-primary); background: var(--bg-secondary); font: inherit; font-size: 12px; }
+.pred-btn { border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 10px; color: var(--text-primary); background: var(--bg-tertiary); font: inherit; font-size: 12px; cursor: pointer; }
+.pred-btn:hover { border-color: var(--primary-color); background: var(--bg-primary); }
+.pred-btn:disabled { cursor: not-allowed; opacity: .6; }
+.pred-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; }
+.pred-card { padding: 20px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-primary); box-shadow: var(--shadow); }
+.pred-card.is-dark { opacity: .55; }
+.pred-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.credential-badge { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; color: #fff; background: var(--primary-color); font-size: 12px; font-weight: 700; }
+.credential-name { margin: 0; min-width: 0; overflow-wrap: anywhere; font-size: 16px; font-weight: 600; }
+.pred-card-sub { color: var(--text-secondary); font-size: 12px; margin: 0 0 6px; }
+.pred-row { padding: 12px 0; border-top: 1px solid var(--border-color); }
+.pred-row-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.pred-row-label { font-weight: 600; }
+.pred-row-remaining { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.pred-track { height: 6px; margin: 7px 0 6px; overflow: hidden; border-radius: 999px; background: var(--bg-tertiary); }
+.pred-fill { height: 100%; border-radius: inherit; background: var(--success-color); transition: width .2s ease; }
+.pred-fill.warn { background: var(--warning-color); }
+.pred-fill.bad { background: var(--error-color); }
+.pred-eta { display: flex; align-items: baseline; gap: 10px; }
+.pred-eta-main { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pred-eta-sub { color: var(--text-secondary); font-size: 11px; }
+.pred-row-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; color: var(--text-secondary); font-size: 11px; }
+.spark { float: right; margin-left: 12px; }
+.pred-muted { color: var(--text-secondary); }
+.pred-error { color: var(--error-color); }
+.pred-stale { color: var(--warning-color); }
+.pred-header { position: relative; padding-right: 76px; }
+.pred-lang { position: absolute; top: -2px; right: 0; min-width: 52px; font-weight: 600; }
+@media (max-width: 768px) {
+  body { padding: 20px 16px; }
+  .pred-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="pred-page">
+  <header class="pred-header">
+    <button id="pred-lang" class="pred-btn pred-lang" type="button" aria-label="切换语言 / Switch language">中文</button>
+    <h1 class="pred-title" id="pred-title">Ollama Usage Prediction</h1>
+    <p class="pred-description" id="pred-description">Projected balance exhaustion per credential and per window, plus fleet capacity. Reads come from the plugin's local sample store — they never consume the account API's 10 req/min budget.</p>
+    <p id="pred-meta" class="pred-meta" role="status" aria-live="polite">Loading samples...</p>
+  </header>
+  <main id="app"><p class="pred-muted">Loading samples...</p></main>
+</div>
+<script>
+(() => {
+  try {
+    const parentDocument = window.parent && window.parent !== window ? window.parent.document : null;
+    const parentRoot = parentDocument && parentDocument.documentElement;
+    const syncTheme = () => {
+      if (!parentRoot) return;
+      const theme = parentRoot.getAttribute("data-theme");
+      if (theme === "white" || theme === "dark") document.documentElement.setAttribute("data-theme", theme);
+      else document.documentElement.removeAttribute("data-theme");
+      const secondary = getComputedStyle(parentRoot).getPropertyValue("--bg-secondary").trim();
+      if (secondary) document.documentElement.style.setProperty("--bg-secondary", secondary);
+      document.body.style.backgroundColor = secondary || "var(--bg-secondary)";
+      if (window.frameElement) {
+        window.frameElement.style.backgroundColor = secondary || "transparent";
+        if (window.frameElement.parentElement) window.frameElement.parentElement.style.backgroundColor = secondary || "transparent";
+      }
+    };
+    syncTheme();
+    if (parentRoot) new MutationObserver(syncTheme).observe(parentRoot, {attributes: true, attributeFilter: ["data-theme"]});
+  } catch (_) {}
+})();
+</script>
+<script>
+(() => {
+  const app = document.getElementById("app");
+  const metaLine = document.getElementById("pred-meta");
+  const endpoint = "/v0/management/plugins/ollama-cliproxyapi/prediction";
+  const storageKey = "ollama-cliproxyapi:prediction";
+  const deadlineKey = "ollama-cliproxyapi:prediction-deadline";
+  const REFRESH_MS = 60 * 1000;
+  /* ---- i18n (zh/en) --------------------------------------------------- */
+  const langKey = "ollama-cliproxyapi:prediction-lang";
+  const I18N = {
+    en: {
+      title: "Ollama Usage Prediction",
+      description: "Projected balance exhaustion per credential and per window, plus fleet capacity. Reads come from the plugin's local sample store — they never consume the account API's 10 req/min budget.",
+      loading: "Loading samples…",
+      meta: "Sampled at {t} · auto-refresh {s}s · view is store-local",
+      "persist-tag": "Persistence",
+      "persist-off": "History lives in process memory only — a restart drops it.",
+      "persist-load-failed": "History file could not be restored — its data is still on disk; this run is memory-only.",
+      "persist-write-failed": "Saving to disk stopped — memory keeps the recent history.",
+      "no-credentials": "No configured credentials.",
+      "load-failed": "Unable to load prediction data.",
+      "err-401": "Management API rejected these credentials (401). Sign in again in Management Center, then retry.",
+      "err-403": "Management API denied access (403). Check your Management Center permissions.",
+      "err-5xx": "Management API is temporarily unavailable. Try again.",
+      "err-req": "Management API request failed. Try again.",
+      "auth-hint": "Open this page from the Management Center after signing in. Credentials are never entered or stored here.",
+      "auth-fallback": "Management Center credentials could not be read. Try again.",
+      "auth-storage-blocked": "Management Center credentials are unavailable here. Your browser may be blocking storage in this embedded page.",
+      "auth-missing": "Management Center credentials were not found. Confirm Remember password is enabled in Management Center, and open this page with Manager and CPA on the same origin (scheme, hostname, and port), then try again.",
+      "auth-unsupported-format": "Management Center credentials use a newer storage format. Reload the Management Center and try again.",
+      "auth-decode-invalid": "Management Center credentials could not be decoded. Reload the Management Center and try again.",
+      "auth-key-missing": "Management Center storage is present, but it does not contain a management key. Sign in again and try again.",
+      "win-included": "Included balance", "win-session": "Session window", "win-weekly": "Weekly window", "win-purchased": "Purchased balance",
+      "state-exhausts-in": "exhausts in", "state-resets-first": "resets first", "state-exhausted": "exhausted", "state-stable": "stable", "state-no-data": "no data",
+      "risk-healthy": "healthy", "risk-tight": "tight", "risk-critical": "critical",
+      "conf-high": "high", "conf-medium": "medium", "conf-low": "low",
+      "fleet-title": "Ollama fleet",
+      "fleet-eta": "Fleet ETA", "fleet-eta-sub": "Σremaining / Σburn",
+      "fleet-first": "First depletion", "fleet-first-sub": "earliest account",
+      "fleet-rate": "Burn rate",
+      "fleet-accounts": "Accounts",
+      "fleet-accounts-sub": "{n} configured · {m} stale",
+      "at-deadline": "At deadline {t}: {m} left · {n} account(s) live · {f}% capacity",
+      "no-burn": "no measurable burn",
+      "eta-in": "in", "eta-after": "",
+      "eta-sub-resets-first": "window refills before exhaustion · burns {m} until reset",
+      "eta-sub-stable": "no measurable burn right now",
+      "eta-sub-exhausted": "waiting for reset",
+      "eta-sub-no-data": "collecting samples ({n} so far, 3+ needed)",
+      "eta-sub-conservative": "conservative pace",
+      "eta-sub-optimistic": " · optimistic ",
+      "eta-sub-shape": " · diurnal shape",
+      "gated-in": "blocked by {w} in {d}",
+      "gated-now": "blocked by {w} (already empty)",
+      "eta-sub-gated": "burn pauses while {w} is empty · resumes after its reset",
+      "acct-exhausted": "exhausted (waiting reset)",
+      "acct-back": "exhausted · back at {t}",
+      "fleet-exhausted-sub": " · {k} waiting reset",
+      "n-samples": " samples", "fast-sampling": "fast sampling", "resets": "resets",
+      "stale-sub": "Stale · last sample {t}", "never": "never",
+      "waiting-first": "Waiting for first sample… (cadence: ~10m, faster near exhaustion)",
+      "sampled-at": "Sampled {t}",
+      "no-window-yet": "No window data yet — the sampler reports within one interval.",
+      "resample": "Re-sample now", "queued": "Queued…"
+    },
+    zh: {
+      title: "Ollama 用量预测",
+      description: "按凭据与窗口预测额度耗尽时间,并汇总总额度容量。读数来自插件本地采样存储——不消耗账号接口每分钟 10 次的限额。",
+      loading: "正在加载采样…",
+      meta: "采样于 {t} · {s} 秒自动刷新 · 视图来自本地采样存储",
+      "persist-tag": "持久化",
+      "persist-off": "历史仅存进程内存,重启即丢。",
+      "persist-load-failed": "历史文件未能恢复——文件数据仍在磁盘上;本次运行仅存内存。",
+      "persist-write-failed": "落盘已停止——内存保留近期历史。",
+      "no-credentials": "未配置任何凭据。",
+      "load-failed": "无法加载预测数据。",
+      "err-401": "管理接口拒绝了当前凭据(401)。请在管理中心重新登录后重试。",
+      "err-403": "管理接口拒绝了访问(403)。请检查管理中心权限。",
+      "err-5xx": "管理接口暂时不可用,请稍后重试。",
+      "err-req": "管理接口请求失败,请重试。",
+      "auth-hint": "请先登录管理中心,再从其中打开本页;凭据不会在本页录入或存储。",
+      "auth-fallback": "无法读取管理中心凭据,请重试。",
+      "auth-storage-blocked": "此处无法访问管理中心凭据,浏览器可能阻止了本内嵌页面使用存储。",
+      "auth-missing": "未找到管理中心凭据。请确认管理中心已勾选“记住密码”,并确保 Manager 与 CPA 同源(协议、域名、端口一致)后重试。",
+      "auth-unsupported-format": "管理中心凭据使用了更新的存储格式。请刷新管理中心后重试。",
+      "auth-decode-invalid": "管理中心凭据解码失败。请刷新管理中心后重试。",
+      "auth-key-missing": "管理中心存储存在,但其中没有管理密钥。请重新登录后重试。",
+      "win-included": "已含额度", "win-session": "会话窗口", "win-weekly": "每周窗口", "win-purchased": "已购额度",
+      "state-exhausts-in": "将耗尽", "state-resets-first": "重置在前", "state-exhausted": "已耗尽", "state-stable": "稳定", "state-no-data": "暂无数据",
+      "risk-healthy": "健康", "risk-tight": "偏紧", "risk-critical": "告急",
+      "conf-high": "高", "conf-medium": "中", "conf-low": "低",
+      "fleet-title": "Ollama 总额度",
+      "fleet-eta": "总额度耗尽", "fleet-eta-sub": "Σ剩余 ÷ Σ消耗",
+      "fleet-first": "最早耗尽", "fleet-first-sub": "账号中最早",
+      "fleet-rate": "消耗速率",
+      "fleet-accounts": "账号",
+      "fleet-accounts-sub": "已配置 {n} · 滞后 {m}",
+      "at-deadline": "截止 {t}:{m} 剩余 · {n} 个账号仍可用 · 剩余容量 {f}%",
+      "no-burn": "暂无可见消耗",
+      "eta-in": "", "eta-after": "后",
+      "eta-sub-resets-first": "重置先于耗尽 · 至重置还将消耗 {m}",
+      "eta-sub-stable": "当前无可见消耗",
+      "eta-sub-exhausted": "等待重置",
+      "eta-sub-no-data": "正在积累采样(已 {n} 个,需 ≥3)",
+      "eta-sub-conservative": "按保守速率",
+      "eta-sub-optimistic": " · 乐观 ",
+      "eta-sub-shape": " · 日内形状加权",
+      "gated-in": "{d}后受{w}限制",
+      "gated-now": "已受{w}限制(窗口已空)",
+      "eta-sub-gated": "{w} 空窗期间暂停燃烧,重置后恢复",
+      "acct-exhausted": "已耗尽 · 等待重置",
+      "acct-back": "已耗尽 · {t} 恢复",
+      "fleet-exhausted-sub": " · {k} 等待重置",
+      "n-samples": " 个样本", "fast-sampling": "加速采样", "resets": "重置于",
+      "stale-sub": "数据滞后 · 上次采样 {t}", "never": "从未",
+      "waiting-first": "等待首次采样…(节奏约 10 分钟,临耗竭时加速)",
+      "sampled-at": "采样于 {t}",
+      "no-window-yet": "暂无窗口数据——采样器会在一个间隔内上报。",
+      "resample": "立即采样", "queued": "已排队…"
+    }
+  };
+  let lang = "en";
+  try {
+    const saved = localStorage.getItem(langKey);
+    lang = saved === "zh" || saved === "en" ? saved
+      : ((navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en");
+  } catch (_) {
+    try { lang = (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en"; } catch (_) {}
+  }
+  // Dictionary lookup: `in` keeps legitimately EMPTY values (en uses
+  // ""-valued suffixes like eta-after) from falling through to the key.
+  function t(key) {
+    const d = I18N[lang] || I18N.en;
+    if (key in d) return d[key];
+    if (key in I18N.en) return I18N.en[key];
+    return key;
+  }
+  function tf(key, vars) {
+    let s = t(key);
+    for (const k in vars || {}) s = s.split("{" + k + "}").join(vars[k]);
+    return s;
+  }
+  /* duration/rate units stay as quasi-international symbols (h/d/%) in
+     both languages; only sentence prose is translated */
+  function fmtDur(seconds) {
+    const s = Number(seconds) || 0;
+    if (s <= 0) return "";
+    const h = s / 3600;
+    if (h < 1) return "<1h";
+    if (h < 48) return (h >= 10 ? Math.round(h) : h.toFixed(1)) + "h";
+    const d = h / 24;
+    return (d >= 10 ? Math.round(d) : d.toFixed(1)) + "d";
+  }
+  let authKey = "";
+  let lastData = null;
+  let lastErrorText = "";
+  let lastErrorKey = "";
+  let authFailStatus = "";
+  let loading = false;
+
+  function authStatus() {
+    const missing = status => ({key: "", status});
+    let raw;
+    try {
+      try { raw = localStorage.getItem("cli-proxy-auth"); }
+      catch (_) { return missing("storage-blocked"); }
+      if (raw == null || raw === "") return missing("missing");
+      let decoded = raw;
+      if (raw.startsWith("enc::v1::") || raw.startsWith("enc::v2::")) {
+        const encoded = raw.slice(9);
+        if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) return missing("decode-invalid");
+        const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+        const seedText = raw.startsWith("enc::v2::") ? "cli-proxy-api-webui::secure-storage|v2|" + location.host : "cli-proxy-api-webui::secure-storage|" + location.host + "|" + navigator.userAgent;
+        const seed = new TextEncoder().encode(seedText);
+        for (let i = 0; i < bytes.length; i++) bytes[i] ^= seed[i % seed.length];
+        decoded = new TextDecoder("utf-8", {fatal: true}).decode(bytes);
+      } else if (raw.startsWith("enc::")) {
+        return missing("unsupported-format");
+      }
+      const parsed = JSON.parse(decoded);
+      if (parsed && parsed.state && typeof parsed.state.managementKey === "string" && parsed.state.managementKey) return {key: parsed.state.managementKey, status: "ok"};
+      return missing("key-missing");
+    } catch (_) { return missing("decode-invalid"); }
+  }
+  function authMessage(status) {
+    return t("auth-" + status) !== "auth-" + status ? t("auth-" + status) : t("auth-fallback");
+  }
+  function request(body) {
+    const headers = {"Content-Type": "application/json"};
+    if (!authKey) return Promise.reject(new Error(authMessage("missing")));
+    headers.Authorization = "Bearer " + authKey;
+    return fetch(endpoint, {method: "POST", headers, body: JSON.stringify(body)}).then(async response => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (response.status === 401) throw fail("err-401");
+        if (response.status === 403) throw fail("err-403");
+        if (response.status === 400 && data && data.error) throw new Error(String(data.error).slice(0, 200));
+        throw fail(response.status >= 500 ? "err-5xx" : "err-req");
+      }
+      return data;
+    });
+  }
+  function fmtMoney(v) { return "$" + (Number(v) || 0).toFixed(2); }
+  function fmtRate(v, unit) {
+    const n = Number(v) || 0;
+    if (n <= 0) return t("no-burn");
+    return unit === "pct" ? n.toFixed(2) + "%/h" : "$" + n.toFixed(3) + "/h";
+  }
+  function inDur(seconds) {
+    if (!Number(seconds)) return "—";
+    return (t("eta-in") ? t("eta-in") + " " : "") + fmtDur(seconds) + t("eta-after");
+  }
+  // D6 precision ladder: high confidence shows a single conservative
+  // estimate, medium shows the optimistic..conservative band, low degrades
+  // to a coarser magnitude so the UI never implies unwarranted precision.
+  // D7 gating: a window frozen by an earlier-emptying sibling shows the
+  // freeze instant instead of its now-moot standalone ETA.
+  function gatingNote(win) {
+    const w = windowLabel(win.gated_by);
+    // Date deltas are ms; fmtDur speaks seconds.
+    const dt = win.gated_at ? (new Date(win.gated_at).getTime() - Date.now()) / 1000 : NaN;
+    return Number.isFinite(dt) && dt > 60000
+      ? tf("gated-in", {d: fmtDur(dt), w: w})
+      : tf("gated-now", {w: w});
+  }
+  function etaMain(win) {
+    if (win.gated_by) return gatingNote(win);
+    if (win.state === "exhausted") return t("state-exhausted");
+    if (win.state === "no-data" || !win.eta_seconds) return "—";
+    if (win.confidence === "high") return inDur(win.eta_seconds);
+    if (win.confidence === "medium" && win.optimistic_eta_seconds && win.optimistic_eta_seconds !== win.eta_seconds) {
+      return (t("eta-in") ? t("eta-in") + " " : "") + fmtDur(win.optimistic_eta_seconds) + "–" + fmtDur(win.eta_seconds) + t("eta-after");
+    }
+    const d = (win.eta_seconds || 0) / 86400;
+    if (d >= 2) return "≈ " + (d >= 10 ? Math.round(d / 5) * 5 : d >= 5 ? Math.round(d) : Math.ceil(d)) + "d";
+    return "≈ " + (win.eta_seconds >= 7200 ? Math.max(1, Math.round(win.eta_seconds / 3600)) + "h" : "<2h");
+  }
+  function etaSub(win) {
+    if (win.gated_by) return tf("eta-sub-gated", {w: windowLabel(win.gated_by)});
+    if (win.state === "resets-first") return tf("eta-sub-resets-first", {m: fmtMoney(win.burn_to_reset)});
+    if (win.state === "stable") return t("eta-sub-stable");
+    if (win.state === "exhausted") return t("eta-sub-exhausted") + (win.resets_at ? " " + new Date(win.resets_at).toLocaleString() : "");
+    if (win.state === "no-data") return tf("eta-sub-no-data", {n: win.samples || 0});
+    let sub = t("eta-sub-conservative");
+    if (win.optimistic_rate_per_hour && win.optimistic_rate_per_hour < win.rate_per_hour) {
+      sub += tf("eta-sub-optimistic", {}) + fmtRate(win.optimistic_rate_per_hour, win.unit);
+    }
+    if (win.shape_aware) sub += t("eta-sub-shape");
+    return sub;
+  }
+  function windowLabel(name) {
+    return (name && t("win-" + name) !== "win-" + name) ? t("win-" + name) : (name || "—");
+  }
+  function stateText(state) {
+    return (state && t("state-" + state) !== "state-" + state) ? t("state-" + state) : state;
+  }
+  function sparkline(series, w, h) {
+    const pts = (series || []).filter(p => Array.isArray(p) && p.length === 2 && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+    if (pts.length < 2) return null;
+    let min = Infinity, max = -Infinity, minT = Infinity, maxT = -Infinity;
+    pts.forEach(p => { min = Math.min(min, p[1]); max = Math.max(max, p[1]); minT = Math.min(minT, p[0]); maxT = Math.max(maxT, p[0]); });
+    const span = max - min, spanT = maxT - minT || 1;
+    const path = pts.map((p, i) => (i ? "L" : "M") + (((p[0] - minT) / spanT) * w).toFixed(1) + "," + (h - span > 0 ? (h - ((p[1] - min) / span) * h) : h).toFixed(1)).join(" ");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+    svg.setAttribute("width", w); svg.setAttribute("height", h); svg.setAttribute("class", "spark");
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", path); line.setAttribute("fill", "none");
+    line.setAttribute("stroke", "var(--primary-color)"); line.setAttribute("stroke-width", "1.5");
+    svg.appendChild(line);
+    return svg;
+  }
+  function projectionChart(projection) {
+    const pts = (projection || []).filter(p => Array.isArray(p) && p.length >= 2 && Number.isFinite(p[1]));
+    const w = 560, h = 96;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("class", "projection");
+    if (pts.length < 2) return svg;
+    let max = 0;
+    pts.forEach(p => { max = Math.max(max, p[1]); });
+    if (max <= 0) max = 1;
+    const path = pts.map((p, i) => (i ? "L" : "M") + ((i / (pts.length - 1)) * w).toFixed(1) + "," + (h - (p[1] / max) * (h - 4)).toFixed(1)).join(" ");
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", path); line.setAttribute("fill", "none");
+    line.setAttribute("stroke", "var(--success-color)"); line.setAttribute("stroke-width", "1.8");
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(line);
+    return svg;
+  }
+  function fleetStat(label, value, sub) {
+    const wrap = document.createElement("div"); wrap.className = "fleet-stat";
+    const k = document.createElement("div"); k.className = "k"; k.textContent = label;
+    const v = document.createElement("div"); v.className = "v"; v.textContent = value;
+    wrap.append(k, v);
+    if (sub) { const s = document.createElement("div"); s.className = "sub"; s.textContent = sub; wrap.appendChild(s); }
+    return wrap;
+  }
+  function renderFleet(fleet) {
+    const card = document.createElement("section"); card.className = "fleet-card";
+    const head = document.createElement("div"); head.className = "fleet-head";
+    const label = document.createElement("span"); label.className = "fleet-label"; label.textContent = t("fleet-title");
+    const badge = document.createElement("span"); badge.className = "badge risk-" + (fleet.risk || "healthy"); badge.textContent = (fleet.risk && t("risk-" + fleet.risk) !== "risk-" + fleet.risk) ? t("risk-" + fleet.risk) : (fleet.risk || "");
+    head.append(label, badge);
+    const total = document.createElement("span"); total.className = "fleet-total";
+    total.textContent = fmtMoney(fleet.remaining_usd) + (fleet.cap_usd > 0 ? " / " + fmtMoney(fleet.cap_usd) : "");
+    head.appendChild(total);
+    card.appendChild(head);
+    const grid = document.createElement("div"); grid.className = "fleet-grid";
+    grid.appendChild(fleetStat(t("fleet-eta"), inDur(fleet.fleet_eta_seconds), t("fleet-eta-sub")));
+    grid.appendChild(fleetStat(t("fleet-first"), inDur(fleet.first_depletion_seconds), t("fleet-first-sub")));
+    grid.appendChild(fleetStat(t("fleet-rate"), fleet.rate_per_hour ? "$" + Number(fleet.rate_per_hour).toFixed(3) + "/h" : "—"));
+    let accountsSub = tf("fleet-accounts-sub", {n: fleet.total_accounts ?? 0, m: fleet.stale_accounts || 0});
+    if (fleet.exhausted_accounts > 0) accountsSub += tf("fleet-exhausted-sub", {k: fleet.exhausted_accounts});
+    grid.appendChild(fleetStat(t("fleet-accounts"), String(fleet.active_accounts ?? 0), accountsSub));
+    card.appendChild(grid);
+    card.appendChild(projectionChart(fleet.projection));
+    if (fleet.at_deadline) {
+      const dl = document.createElement("div"); dl.className = "pred-row meta";
+      const frac = Math.round((fleet.at_deadline.fraction || 0) * 100);
+      dl.innerHTML = "";
+      const span = document.createElement("div"); span.className = "fleet-sub";
+      span.textContent = tf("at-deadline", {
+        t: new Date(fleet.at_deadline.deadline).toLocaleString(),
+        m: fmtMoney(fleet.at_deadline.available_usd),
+        n: fleet.at_deadline.available_accounts, f: frac
+      });
+      dl.appendChild(span); card.appendChild(dl);
+    }
+    return card;
+  }
+  function renderWindow(win) {
+    const row = document.createElement("div"); row.className = "pred-row";
+    const head = document.createElement("div"); head.className = "pred-row-head";
+    const label = document.createElement("span"); label.className = "pred-row-label"; label.textContent = windowLabel(win.name);
+    const remaining = document.createElement("span"); remaining.className = "pred-row-remaining";
+    remaining.textContent = win.unit === "pct" ? Math.round(win.remaining) + "%" : fmtMoney(win.remaining) + (win.cap ? " / " + fmtMoney(win.cap) : "");
+    head.append(label, remaining); row.appendChild(head);
+    const frac = win.unit === "pct" ? win.remaining / 100 : (win.cap > 0 ? win.remaining / win.cap : 0);
+    const track = document.createElement("div"); track.className = "pred-track";
+    const fill = document.createElement("div"); fill.className = "pred-fill" + (frac < 0.1 ? " bad" : frac < 0.3 ? " warn" : "");
+    fill.style.width = Math.max(0, Math.min(100, frac * 100)) + "%";
+    track.appendChild(fill); row.appendChild(track);
+    const eta = document.createElement("div"); eta.className = "pred-eta";
+    const main = document.createElement("span"); main.className = "pred-eta-main"; main.textContent = etaMain(win);
+    const sub = document.createElement("span"); sub.className = "pred-eta-sub"; sub.textContent = etaSub(win);
+    eta.append(main, sub); row.appendChild(eta);
+    const meta = document.createElement("div"); meta.className = "pred-row-meta";
+    const confKey = "conf-" + (win.confidence || "low");
+    const conf = document.createElement("span"); conf.className = "badge " + confKey; conf.textContent = t(confKey);
+    meta.appendChild(conf);
+    const bits = [fmtRate(win.rate_per_hour, win.unit), (win.samples || 0) + t("n-samples")];
+    if (win.accelerated) bits.push(t("fast-sampling"));
+    if (win.resets_at) bits.push(t("resets") + " " + new Date(win.resets_at).toLocaleString());
+    bits.forEach(b => { const s = document.createElement("span"); s.textContent = b; meta.appendChild(s); });
+    row.appendChild(meta);
+    const spark = sparkline(win.series, 110, 26);
+    if (spark) row.appendChild(spark);
+    row.style.clear = "both";
+    return row;
+  }
+  function renderAccount(acc) {
+    const card = document.createElement("section"); card.className = "pred-card" + (acc.status === "exhausted" ? " is-dark" : "");
+    const header = document.createElement("div"); header.className = "pred-card-header";
+    const badge = document.createElement("span"); badge.className = "credential-badge"; badge.textContent = "OL"; badge.setAttribute("aria-hidden", "true");
+    const title = document.createElement("h2"); title.className = "credential-name"; title.textContent = acc.label || acc.key_id;
+    header.append(badge, title);
+    if (acc.status === "exhausted") {
+      const wait = document.createElement("span"); wait.className = "badge state-exhausted";
+      wait.textContent = acc.next_reset
+        ? tf("acct-back", {t: new Date(acc.next_reset).toLocaleString()})
+        : t("acct-exhausted");
+      header.appendChild(wait);
+    }
+    card.appendChild(header);
+    const sub = document.createElement("p"); sub.className = "pred-card-sub" + (acc.stale ? " pred-stale" : "");
+    sub.textContent = acc.stale
+      ? tf("stale-sub", {t: acc.updated_at ? new Date(acc.updated_at).toLocaleString() : t("never")})
+      : (!acc.updated_at ? t("waiting-first") : tf("sampled-at", {t: new Date(acc.updated_at).toLocaleString()}));
+    card.appendChild(sub);
+    if (!(acc.windows || []).length) {
+      const p = document.createElement("div"); p.className = "pred-muted"; p.textContent = t("no-window-yet");
+      card.appendChild(p);
+    } else {
+      acc.windows.forEach(win => card.appendChild(renderWindow(win)));
+    }
+    const actions = document.createElement("div"); actions.className = "deadline-row";
+    const btn = document.createElement("button"); btn.className = "pred-btn"; btn.textContent = t("resample");
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = t("queued");
+      try { await request({refresh: true, key_id: acc.key_id}); } catch (_) {}
+      setTimeout(load, 3000);
+    };
+    actions.appendChild(btn); card.appendChild(actions);
+    return card;
+  }
+  function render(data) {
+    app.textContent = "";
+    renderPersistBanner(data);
+    const fleet = data.by_type && data.by_type.ollama;
+    if (fleet) app.appendChild(renderFleet(fleet));
+    const accounts = data.accounts || [];
+    if (!accounts.length) {
+      const p = document.createElement("p"); p.className = "pred-muted"; p.textContent = t("no-credentials"); app.appendChild(p);
+    } else {
+      const grid = document.createElement("div"); grid.className = "pred-grid";
+      accounts.forEach(acc => grid.appendChild(renderAccount(acc)));
+      app.appendChild(grid);
+    }
+    if (metaLine) {
+      metaLine.textContent = tf("meta", {
+        t: data.generated_at ? new Date(data.generated_at).toLocaleString() : "—",
+        s: Math.round(REFRESH_MS / 1000)
+      });
+    }
+  }
+  // D10: persistence degradation is visible, not silent.
+  function renderPersistBanner(data) {
+    const st = data.persistence;
+    if (!st || st.state === "ok") return;
+    const msgKey = "persist-" + st.state;
+    const msg = (msgKey in I18N[lang] || msgKey in I18N.en) ? t(msgKey) : st.state;
+    const banner = document.createElement("div"); banner.className = "pred-banner";
+    const tag = document.createElement("span"); tag.className = "pred-banner-tag"; tag.textContent = t("persist-tag");
+    const msgEl = document.createElement("span"); msgEl.textContent = msg;
+    banner.appendChild(tag); banner.appendChild(msgEl);
+    if (st.detail) {
+      const det = document.createElement("span"); det.className = "pred-banner-detail"; det.textContent = "(" + st.detail + ")";
+      banner.appendChild(det);
+    }
+    app.appendChild(banner);
+  }
+  function saveData(data) {
+    try { localStorage.setItem(storageKey, JSON.stringify({data, at: new Date().toISOString()})); } catch (_) {}
+  }
+  function paintCache() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(storageKey) || "null");
+      if (parsed && parsed.data && parsed.data.by_type) render(parsed.data);
+    } catch (_) {}
+  }
+  function fail(key) {
+    const e = new Error(t(key));
+    e.i18nKey = key;
+    return e;
+  }
+  function repaintLastError() {
+    app.textContent = "";
+    const p = document.createElement("p"); p.className = "pred-error"; p.setAttribute("role", "status");
+    p.textContent = (lastErrorKey ? t(lastErrorKey) : "") || lastErrorText || t("load-failed");
+    app.appendChild(p);
+  }
+  function renderAuthFailure(status) {
+    app.textContent = "";
+    const p = document.createElement("p"); p.className = "pred-error"; p.setAttribute("role", "status");
+    p.textContent = authMessage(status);
+    const h = document.createElement("p"); h.className = "pred-muted"; h.textContent = t("auth-hint");
+    app.append(p, h);
+  }
+  function applyI18nStatic() {
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+    const title = document.getElementById("pred-title");
+    const description = document.getElementById("pred-description");
+    const toggle = document.getElementById("pred-lang");
+    if (title) title.textContent = t("title");
+    if (description) description.textContent = t("description");
+    if (toggle) toggle.textContent = lang === "zh" ? "EN" : "中文";
+    if (metaLine && !lastData) {
+      metaLine.textContent = authFailStatus || lastErrorText ? "" : t("loading");
+    }
+    const loadingNode = app.querySelector("p.pred-muted");
+    if (!lastData && !authFailStatus && !lastErrorText && loadingNode) loadingNode.textContent = t("loading");
+  }
+  function setLangView() {
+    try { localStorage.setItem(langKey, lang); } catch (_) {}
+    document.title = t("title");
+    applyI18nStatic();
+    if (lastData) render(lastData);
+    else if (authFailStatus) renderAuthFailure(authFailStatus);
+    else if (lastErrorText) repaintLastError();
+    else paintCache();
+  }
+  async function load() {
+    if (loading) return;
+    loading = true;
+    try {
+      const data = await request({});
+      lastData = data;
+      saveData(data);
+      render(data);
+    } catch (err) {
+      lastErrorKey = err && err.i18nKey ? err.i18nKey : "";
+      lastErrorText = err.message || t("load-failed");
+      repaintLastError();
+    } finally { loading = false; }
+  }
+  document.title = t("title");
+  const toggle = document.getElementById("pred-lang");
+  if (toggle) {
+    toggle.textContent = lang === "zh" ? "EN" : "中文";
+    toggle.onclick = () => {
+      lang = lang === "zh" ? "en" : "zh";
+      setLangView();
+    };
+  }
+  applyI18nStatic();
+  const initialAuth = authStatus();
+  if (initialAuth.key) {
+    authKey = initialAuth.key;
+    paintCache();
+    load();
+    setInterval(load, REFRESH_MS);
+  } else {
+    const retryAuth = initialAuth.status === "storage-blocked" ? authStatus() : initialAuth;
+    if (!retryAuth.key) {
+      authFailStatus = retryAuth.status;
+      renderAuthFailure(authFailStatus);
+      applyI18nStatic();
+      return;
+    }
+    authKey = retryAuth.key;
+    paintCache();
+    load();
+    setInterval(load, REFRESH_MS);
+  }
+})();
+</script>
+</body>
+</html>

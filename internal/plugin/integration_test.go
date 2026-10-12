@@ -206,28 +206,26 @@ func writeSSE(w http.ResponseWriter, frames []string) {
 // mockCommandCode is a stand-in CommandCode server with mutable outage state,
 // swappable catalog / messages payloads, and a scriptable chat endpoint.
 type mockCommandCode struct {
-	mu                   sync.Mutex
-	srv                  *httptest.Server
-	catalogDown          bool
-	catalogBody          string
-	messagesBody         string
-	responsesBody        string
-	lastPath             string
-	lastAuth             string
-	lastChatSession      string
-	lastChatBody         []byte
-	lastMessagesAuth     string
-	lastMessagesVersion  string
-	lastMessagesSession  string
-	lastMessagesBody     []byte
-	lastResponsesAuth    string
-	lastResponsesSession string
-	lastResponsesBody    []byte
-	chatHits             int
-	chatPlan             func(hit int) (status int, retryAfter string, body string)
-	chatFrames           []string
-	chatBody             string
-	authSeen             []string
+	mu                  sync.Mutex
+	srv                 *httptest.Server
+	catalogDown         bool
+	catalogBody         string
+	messagesBody        string
+	responsesBody       string
+	lastPath            string
+	lastAuth            string
+	lastChatAuth        string
+	lastChatBody        []byte
+	lastMessagesAuth    string
+	lastMessagesVersion string
+	lastMessagesBody    []byte
+	lastResponsesAuth   string
+	lastResponsesBody   []byte
+	chatHits            int
+	chatPlan            func(hit int) (status int, retryAfter string, body string)
+	chatFrames          []string
+	chatBody            string
+	authSeen            []string
 }
 
 func newMockCommandCode(t *testing.T) *mockCommandCode {
@@ -252,7 +250,6 @@ func newMockCommandCode(t *testing.T) *mockCommandCode {
 		st.mu.Lock()
 		st.lastPath = r.URL.Path
 		st.lastAuth = r.Header.Get("Authorization")
-		st.lastChatSession = r.Header.Get("x-commandcode-session")
 		st.lastChatBody = body
 		st.authSeen = append(st.authSeen, r.Header.Get("Authorization"))
 		st.chatHits++
@@ -290,9 +287,10 @@ func newMockCommandCode(t *testing.T) *mockCommandCode {
 		var parsed map[string]any
 		_ = json.Unmarshal(body, &parsed)
 		st.mu.Lock()
-		st.lastMessagesAuth = r.Header.Get("x-api-key")
+		// Ollama's messages endpoint authenticates with Authorization
+		// Bearer only (x-api-key is rejected upstream).
+		st.lastMessagesAuth = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		st.lastMessagesVersion = r.Header.Get("Anthropic-Version")
-		st.lastMessagesSession = r.Header.Get("x-commandcode-session")
 		st.lastMessagesBody = body
 		st.mu.Unlock()
 		if stream, _ := parsed["stream"].(bool); stream {
@@ -308,9 +306,8 @@ func newMockCommandCode(t *testing.T) *mockCommandCode {
 	mux.HandleFunc("/v1/messages-override", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		st.mu.Lock()
-		st.lastMessagesAuth = r.Header.Get("x-api-key")
+		st.lastMessagesAuth = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		st.lastMessagesVersion = r.Header.Get("Anthropic-Version")
-		st.lastMessagesSession = r.Header.Get("x-commandcode-session")
 		st.lastMessagesBody = body
 		st.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -322,7 +319,6 @@ func newMockCommandCode(t *testing.T) *mockCommandCode {
 		_ = json.Unmarshal(body, &parsed)
 		st.mu.Lock()
 		st.lastResponsesAuth = r.Header.Get("Authorization")
-		st.lastResponsesSession = r.Header.Get("x-commandcode-session")
 		st.lastResponsesBody = body
 		st.mu.Unlock()
 		if stream, _ := parsed["stream"].(bool); stream {
@@ -536,12 +532,6 @@ func TestChatNonStreamRoundTrip(t *testing.T) {
 	if auth != "Bearer sk-test-1" {
 		t.Fatalf("mock Authorization = %q", auth)
 	}
-	st.mu.Lock()
-	chatSession := st.lastChatSession
-	st.mu.Unlock()
-	if chatSession != "8fa02f28ce729c164657f5ab84cd1e38f690981132765ab45c6a71aeeb3dacd1" {
-		t.Fatalf("mock x-commandcode-session = %q", chatSession)
-	}
 	if upstream["model"] != "glm-5.2" {
 		t.Fatalf("upstream model = %v, want bare glm-5.2", upstream["model"])
 	}
@@ -648,9 +638,9 @@ func assertCleanStreamClose(t *testing.T, f *fakeCaller) {
 }
 
 // TestMessagesNonStreamRoundTrip covers AC §C: a claude-format request with
-// system + tools reaches /v1/messages with x-api-key and anthropic-version
-// auth, rewritten model, folded system; the Anthropic response (text +
-// tool_use + usage) passes back natively.
+// system + tools reaches /v1/messages with Bearer auth and anthropic-version,
+// rewritten model, folded system; the Anthropic response (text + tool_use +
+// usage) passes back natively.
 func TestMessagesNonStreamRoundTrip(t *testing.T) {
 	m, _, st, _ := newIntegrationManager(t)
 
@@ -663,16 +653,13 @@ func TestMessagesNonStreamRoundTrip(t *testing.T) {
 	}
 
 	st.mu.Lock()
-	auth, version, session, raw := st.lastMessagesAuth, st.lastMessagesVersion, st.lastMessagesSession, st.lastMessagesBody
+	auth, version, raw := st.lastMessagesAuth, st.lastMessagesVersion, st.lastMessagesBody
 	st.mu.Unlock()
 	if auth != "sk-test-1" {
-		t.Fatalf("mock x-api-key = %q", auth)
+		t.Fatalf("mock bearer key = %q", auth)
 	}
 	if version == "" {
 		t.Fatal("anthropic-version header missing")
-	}
-	if session != "115ff558a2b5fa032b29f2f452673404575e82417d2843e0f410e890c3e85efa" {
-		t.Fatalf("mock x-commandcode-session = %q", session)
 	}
 	var upstream map[string]any
 	if err := json.Unmarshal(raw, &upstream); err != nil {
@@ -730,13 +717,10 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 	}
 
 	st.mu.Lock()
-	auth, session, raw := st.lastResponsesAuth, st.lastResponsesSession, st.lastResponsesBody
+	auth, raw := st.lastResponsesAuth, st.lastResponsesBody
 	st.mu.Unlock()
 	if auth != "Bearer sk-test-1" {
 		t.Fatalf("mock Authorization = %q", auth)
-	}
-	if session != "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4" {
-		t.Fatalf("mock x-commandcode-session = %q", session)
 	}
 	var upstream map[string]any
 	if err := json.Unmarshal(raw, &upstream); err != nil {
@@ -815,13 +799,9 @@ func TestChatStreamingRoundTrip(t *testing.T) {
 
 	st.mu.Lock()
 	sawStream := strings.Contains(string(st.lastChatBody), `"stream":true`)
-	session := st.lastChatSession
 	st.mu.Unlock()
 	if !sawStream {
 		t.Fatal("mock did not see stream:true")
-	}
-	if session != "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4" {
-		t.Fatalf("mock x-commandcode-session = %q", session)
 	}
 
 	events := emittedEvents(t, f)
@@ -859,13 +839,9 @@ func TestMessagesStreamingRoundTrip(t *testing.T) {
 	m.bridge.WaitForInFlight(5 * time.Second)
 	st.mu.Lock()
 	sawStream := strings.Contains(string(st.lastMessagesBody), `"stream":true`)
-	session := st.lastMessagesSession
 	st.mu.Unlock()
 	if !sawStream {
 		t.Fatal("mock did not see stream:true")
-	}
-	if session != "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4" {
-		t.Fatalf("mock x-commandcode-session = %q", session)
 	}
 
 	events := emittedEvents(t, f)
@@ -894,13 +870,9 @@ func TestResponsesStreamingRoundTrip(t *testing.T) {
 	m.bridge.WaitForInFlight(5 * time.Second)
 	st.mu.Lock()
 	sawStream := strings.Contains(string(st.lastResponsesBody), `"stream":true`)
-	session := st.lastResponsesSession
 	st.mu.Unlock()
 	if !sawStream {
 		t.Fatal("mock did not see stream:true")
-	}
-	if session != "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4" {
-		t.Fatalf("mock x-commandcode-session = %q", session)
 	}
 
 	events := emittedEvents(t, f)
@@ -1109,7 +1081,9 @@ func TestResponsesUnsupportedFeatureDescriptive(t *testing.T) {
 // ---- AC §E upstream errors + §F security, end to end -------------------
 
 func integrationTwoKeyYAML(baseURL string) string {
-	return fmt.Sprintf("base-url: %s/v1\nallow-http: true\napi-keys:\n  - value: sk-test-1\n  - value: sk-test-2\n", baseURL)
+	// The base-url is the bare authority (spec): the route endpoints already
+	// carry the /v1 prefix, so no version segment belongs in the base.
+	return fmt.Sprintf("base-url: %s\nallow-http: true\napi-keys:\n  - value: sk-test-1\n  - value: sk-test-2\n", baseURL)
 }
 
 func newTwoKeyManager(t *testing.T) (*Manager, *fakeCaller, *mockCommandCode) {

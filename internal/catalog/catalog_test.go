@@ -89,10 +89,10 @@ func TestRouteEndpointPath(t *testing.T) {
 
 func TestResolveRouteResponsesCapabilityAndFallback(t *testing.T) {
 	cases := []struct {
-		name       string
-		endpoints  []string
-		wantRoute  Route
-		wantPath   string
+		name      string
+		endpoints []string
+		wantRoute Route
+		wantPath  string
 	}{
 		{"official endpoint", []string{"/responses"}, RouteResponses, "/v1/responses"},
 		{"legacy versioned endpoint", []string{" /v1/responses "}, RouteResponses, "/v1/responses"},
@@ -131,7 +131,7 @@ func TestResolveRouteSourceAndOverridePrecedence(t *testing.T) {
 func TestSeedFromRetainsSupportedEndpoints(t *testing.T) {
 	prev := newManager(testCfg(), &fakeClient{resp: pluginapi.HTTPResponse{
 		StatusCode: 200,
-		Body: []byte(`{"data":[{"id":"responses-model","supported_endpoints":["/responses"]}]}`),
+		Body:       []byte(`{"data":[{"id":"responses-model","supported_endpoints":["/responses"]}]}`),
 	}})
 	mustRefresh(t, prev)
 
