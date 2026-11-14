@@ -88,6 +88,13 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
 .pred-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .credential-badge { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; color: #fff; background: var(--primary-color); font-size: 12px; font-weight: 700; }
 .credential-name { margin: 0; min-width: 0; overflow-wrap: anywhere; font-size: 16px; font-weight: 600; }
+.first-depletion-control { display: block; width: 100%; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.first-depletion-control:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 5px; border-radius: 4px; }
+.first-account-name { display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; margin-top: 4px; }
+.fleet-stat { min-width: 0; }
+.first-depletion-badge { color: #935000; background: rgba(222, 144, 32, .18); }
+[data-theme="dark"] .first-depletion-badge { color: #ffcf80; }
+.pred-card.depletion-highlight { outline: 3px solid #d99020; outline-offset: 3px; }
 .pred-card-sub { color: var(--text-secondary); font-size: 12px; margin: 0 0 6px; }
 .pred-row { padding: 12px 0; border-top: 1px solid var(--border-color); }
 .pred-row-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
@@ -196,6 +203,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       "fleet-title": "Ollama fleet",
       "fleet-eta": "Fleet ETA", "fleet-eta-sub": "Σremaining / Σburn",
       "fleet-first": "First depletion", "fleet-first-sub": "earliest account",
+      "first-badge": "First depletion · {eta}", "first-jump": "Locate account: {name}", "first-none": "No prediction",
       "fleet-rate": "Burn rate",
       "fleet-accounts": "Accounts",
       "fleet-accounts-sub": "{n} configured · {m} stale",
@@ -257,6 +265,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
       "fleet-title": "Ollama 总额度",
       "fleet-eta": "总额度耗尽", "fleet-eta-sub": "Σ剩余 ÷ Σ消耗",
       "fleet-first": "最早耗尽", "fleet-first-sub": "账号中最早",
+      "first-badge": "最先耗尽 · {eta}", "first-jump": "定位账号：{name}", "first-none": "暂无预测",
       "fleet-rate": "消耗速率",
       "fleet-accounts": "账号",
       "fleet-accounts-sub": "已配置 {n} · 滞后 {m}",
@@ -498,7 +507,7 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     if (sub) { const s = document.createElement("div"); s.className = "sub"; s.textContent = sub; wrap.appendChild(s); }
     return wrap;
   }
-  function renderFleet(fleet, typeLabel) {
+  function renderFleet(fleet, typeLabel, firstAccount, locateAccount) {
     const card = document.createElement("section"); card.className = "fleet-card";
     const head = document.createElement("div"); head.className = "fleet-head";
     const label = document.createElement("span"); label.className = "fleet-label";
@@ -511,7 +520,21 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     card.appendChild(head);
     const grid = document.createElement("div"); grid.className = "fleet-grid";
     grid.appendChild(fleetStat(t("fleet-eta"), inDur(fleet.fleet_eta_seconds), t("fleet-eta-sub")));
-    grid.appendChild(fleetStat(t("fleet-first"), inDur(fleet.first_depletion_seconds), t("fleet-first-sub")));
+    const first = fleetStat(t("fleet-first"), fleet.first_depletion_seconds > 0 ? inDur(fleet.first_depletion_seconds) : t("first-none"), t("fleet-first-sub"));
+    if (firstAccount && fleet.first_depletion_seconds > 0) {
+      const name = String(firstAccount.label || firstAccount.key_id);
+      const label = document.createElement("span"); label.className = "first-account-name";
+      label.textContent = name; label.title = name;
+      const button = document.createElement("button"); button.type = "button";
+      button.className = "first-depletion-control";
+      button.setAttribute("aria-label", t("fleet-first") + " · " + inDur(fleet.first_depletion_seconds) + " · " + tf("first-jump", {name}));
+      // Keep the complete stat clickable; account labels stay text, not HTML or selectors.
+      const content = document.createElement("div");
+      while (first.firstChild) content.appendChild(first.firstChild);
+      button.append(content, label); button.onclick = locateAccount;
+      first.appendChild(button);
+    }
+    grid.appendChild(first);
     grid.appendChild(fleetStat(t("fleet-rate"), fleet.rate_per_hour ? "$" + Number(fleet.rate_per_hour).toFixed(3) + "/h" : "—"));
     let accountsSub = tf("fleet-accounts-sub", {n: fleet.total_accounts ?? 0, m: fleet.stale_accounts || 0});
     if (fleet.exhausted_accounts > 0) accountsSub += tf("fleet-exhausted-sub", {k: fleet.exhausted_accounts});
@@ -563,12 +586,17 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     row.style.clear = "both";
     return row;
   }
-  function renderAccount(acc) {
+  function renderAccount(acc, firstDepletionSeconds) {
     const card = document.createElement("section"); card.className = "pred-card" + (acc.status === "exhausted" ? " is-dark" : "");
     const header = document.createElement("div"); header.className = "pred-card-header";
     const badge = document.createElement("span"); badge.className = "credential-badge"; badge.textContent = "OL"; badge.setAttribute("aria-hidden", "true");
     const title = document.createElement("h2"); title.className = "credential-name"; title.textContent = acc.label || acc.key_id;
     header.append(badge, title);
+    if (firstDepletionSeconds > 0) {
+      const firstBadge = document.createElement("span"); firstBadge.className = "badge first-depletion-badge";
+      firstBadge.textContent = tf("first-badge", {eta: inDur(firstDepletionSeconds)});
+      header.appendChild(firstBadge);
+    }
     if (acc.status === "exhausted") {
       const wait = document.createElement("span"); wait.className = "badge state-exhausted";
       wait.textContent = acc.next_reset
@@ -602,13 +630,30 @@ body { margin: 0; padding: 32px; color: var(--text-primary); background: var(--b
     app.textContent = "";
     renderPersistBanner(data);
     const fleet = data.by_type && data.by_type.ollama;
-    if (fleet) app.appendChild(renderFleet(fleet));
     const accounts = data.accounts || [];
+    const firstAccount = fleet && fleet.first_depletion_seconds > 0
+      ? accounts.find(acc => acc.key_id === fleet.first_depletion_key_id) : null;
+    let firstCard = null;
+    const locateAccount = () => {
+      if (!firstCard) return;
+      const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      firstCard.scrollIntoView({behavior: reduced ? "auto" : "smooth", block: "center"});
+      firstCard.setAttribute("tabindex", "-1"); firstCard.focus({preventScroll: true});
+      firstCard.classList.add("depletion-highlight");
+      const card = firstCard;
+      setTimeout(() => card.classList.remove("depletion-highlight"), 2000);
+    };
+    if (fleet) app.appendChild(renderFleet(fleet, null, firstAccount, locateAccount));
     if (!accounts.length) {
       const p = document.createElement("p"); p.className = "pred-muted"; p.textContent = t("no-credentials"); app.appendChild(p);
     } else {
       const grid = document.createElement("div"); grid.className = "pred-grid";
-      accounts.forEach(acc => grid.appendChild(renderAccount(acc)));
+      accounts.forEach(acc => {
+        const winner = acc === firstAccount;
+        const card = renderAccount(acc, winner ? fleet.first_depletion_seconds : 0);
+        if (winner) firstCard = card;
+        grid.appendChild(card);
+      });
       app.appendChild(grid);
     }
     if (metaLine) {

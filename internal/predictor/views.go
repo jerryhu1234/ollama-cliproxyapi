@@ -45,18 +45,20 @@ type AccountView struct {
 // first depletion, risk badge, the hourly capacity projection and the
 // optional deadline snapshot.
 type FleetView struct {
-	RemainingUSD      float64           `json:"remaining_usd"`
-	CapUSD            float64           `json:"cap_usd"`
-	RatePerHour       float64           `json:"rate_per_hour"`
-	FleetETA          float64           `json:"fleet_eta_seconds"`
-	FirstDepletion    float64           `json:"first_depletion_seconds"`
-	ActiveAccounts    int               `json:"active_accounts"`
-	StaleAccounts     int               `json:"stale_accounts"`
-	TotalAccounts     int               `json:"total_accounts"`
-	ExhaustedAccounts int               `json:"exhausted_accounts,omitempty"`
-	Risk              string            `json:"risk"`
-	Projection        []ProjectionPoint `json:"projection"`
-	AtDeadline        *DeadlineView     `json:"at_deadline,omitempty"`
+	RemainingUSD         float64           `json:"remaining_usd"`
+	CapUSD               float64           `json:"cap_usd"`
+	RatePerHour          float64           `json:"rate_per_hour"`
+	FleetETA             float64           `json:"fleet_eta_seconds"`
+	FirstDepletion       float64           `json:"first_depletion_seconds"`
+	FirstDepletionKeyID  string            `json:"first_depletion_key_id,omitempty"`
+	FirstDepletionWindow string            `json:"first_depletion_window,omitempty"`
+	ActiveAccounts       int               `json:"active_accounts"`
+	StaleAccounts        int               `json:"stale_accounts"`
+	TotalAccounts        int               `json:"total_accounts"`
+	ExhaustedAccounts    int               `json:"exhausted_accounts,omitempty"`
+	Risk                 string            `json:"risk"`
+	Projection           []ProjectionPoint `json:"projection"`
+	AtDeadline           *DeadlineView     `json:"at_deadline,omitempty"`
 }
 
 // ProjectionPoint is [unix_ms, available_usd, active_accounts].

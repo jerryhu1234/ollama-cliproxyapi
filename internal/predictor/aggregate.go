@@ -224,16 +224,18 @@ func BuildFleetView(store *Store, keyIDs []string, opts FleetOptions, deadline *
 		for name, w := range in.windows {
 			gates = append(gates, darkGate{name: name, unit: w.unit, remaining: w.remaining, resets: w.resets, samples: w.samples})
 		}
-		if dark, _ := evaluateDark(gates); dark {
+		dark, _ := evaluateDark(gates)
+		if dark {
 			view.ExhaustedAccounts++
 		} else {
 			liveRem += rem
 			liveRate += rate
 		}
-		// First depletion: earliest exhausts-in window of the account.
+		// First depletion only considers accounts that can currently serve.
+		// A closed gate freezes every window, so residual burn estimates
+		// must not make a waiting-reset account win the next-depletion ETA.
 		for name, w := range in.windows {
-			_ = name
-			if !w.published || w.remaining <= epsZero {
+			if dark || !w.published || w.remaining <= epsZero {
 				continue
 			}
 			if w.rate <= epsRate {
@@ -242,6 +244,10 @@ func BuildFleetView(store *Store, keyIDs []string, opts FleetOptions, deadline *
 			eta, _, exhausts := walkEta(w.remaining, w.rate, nil, opts.Now, w.resets, etaWalkMaxHour)
 			if exhausts && eta > 0 && eta < minTime {
 				minTime = eta
+				view.FirstDepletionKeyID = in.keyID
+				view.FirstDepletionWindow = name
+			} else if exhausts && eta > 0 && eta == minTime && view.FirstDepletionKeyID == in.keyID && name < view.FirstDepletionWindow {
+				view.FirstDepletionWindow = name
 			}
 		}
 		// Projection walk (flat conservative rates with reset bumps, plan §5).
