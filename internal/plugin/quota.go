@@ -22,9 +22,14 @@ import (
 // a local base-url (allow-http) exposes no balance/usage API, and those
 // credentials are reported as unavailable instead of being probed.
 // A provider API key authenticates them (Authorization: Bearer <key>).
-// Both endpoints are rate limited to 10 requests/minute/user (HTTP 429 with
-// Retry-After), so each snapshot costs exactly two upstream calls.
+// /api/me is undocumented but is the same POST the official Ollama desktop
+// app uses; it supplies the account email shown as the card label and is
+// cached for accountLabelTTL because identity changes rarely.
+// /api/balance and /api/usage are rate limited to 10 requests/minute/user
+// (HTTP 429 with Retry-After), so each snapshot costs exactly two upstream
+// calls; the identity probe adds at most one call per label TTL.
 const (
+	accountMePath      = "/api/me"
 	accountBalancePath = "/api/balance"
 	accountUsagePath   = "/api/usage"
 	// usageRangeDefault is the usage window rendered on the quota page; the
@@ -36,6 +41,9 @@ const (
 	// interactive, so a stalled upstream must fail fast rather than inherit
 	// the (request-timeout, default 5m) upstream budget.
 	quotaMaxTimeout = 30 * time.Second
+	// accountLabelTTL is how long an account email is reused before the
+	// next snapshot re-probes /api/me.
+	accountLabelTTL = 12 * time.Hour
 )
 
 // quotaRow is one metered window as rendered by the page. Rows carry a
@@ -70,6 +78,9 @@ type quotaUsage struct {
 	// Plan labels the account when the legacy percent-window shape reported
 	// it implicitly; currently unused for Ollama but kept for ABI parity.
 	RefreshedAt string `json:"refreshed_at"`
+	// AccountLabel is the account email (name fallback) resolved from
+	// /api/me. It is display-only and never rendered inside the usage JSON.
+	AccountLabel string `json:"-"`
 }
 
 type quotaCard struct {
@@ -100,6 +111,13 @@ type usdPeriod struct {
 type percentWindow struct {
 	RemainingPercent float64 `json:"remaining_percent"`
 	ResetsAt         string  `json:"resets_at"`
+}
+
+// accountMeResponse is the display subset of POST /api/me. Email is the
+// primary label; Name covers accounts that expose no address.
+type accountMeResponse struct {
+	Email string `json:"email"`
+	Name  string `json:"name"`
 }
 
 type balanceResponse struct {
@@ -150,6 +168,90 @@ func quotaIdentity(key string) (id, label string) {
 	return authRecordIDFromHash(hash), "Ollama credential " + hash[:12]
 }
 
+// cachedAccountLabel returns the cached email for one credential, or "" when
+// it is absent or stale. The cache is keyed by the non-secret key digest.
+func (m *Manager) cachedAccountLabel(key string) string {
+	if m == nil {
+		return ""
+	}
+	hash := authKeyHash(key)
+	m.labelMu.Lock()
+	entry, ok := m.labelCache[hash]
+	m.labelMu.Unlock()
+	if !ok || entry.label == "" || time.Since(entry.fetchedAt) > accountLabelTTL {
+		return ""
+	}
+	return entry.label
+}
+
+// rememberAccountLabel stores one successful identity probe.
+func (m *Manager) rememberAccountLabel(key, label string) {
+	label = strings.TrimSpace(label)
+	if m == nil || label == "" {
+		return
+	}
+	hash := authKeyHash(key)
+	m.labelMu.Lock()
+	if m.labelCache == nil {
+		m.labelCache = make(map[string]labelEntry)
+	}
+	m.labelCache[hash] = labelEntry{label: label, fetchedAt: time.Now()}
+	m.labelMu.Unlock()
+}
+
+// credentialLabel is the display label for a quota card or list row: the
+// account email when it has been resolved, otherwise the digest fallback.
+func (m *Manager) credentialLabel(key string) string {
+	if label := m.cachedAccountLabel(key); label != "" {
+		return label
+	}
+	_, fallback := quotaIdentity(key)
+	return fallback
+}
+
+// probeAccountLabel resolves one credential's account email via POST
+// /api/me. It is best-effort: any failure leaves the digest fallback in
+// place and never fails the balance snapshot. A successful probe is cached
+// so subsequent snapshots make no extra upstream call.
+func (m *Manager) probeAccountLabel(ctx context.Context, bridge *HostBridge, base string, timeout time.Duration, key string) string {
+	if label := m.cachedAccountLabel(key); label != "" {
+		return label
+	}
+	if bridge == nil {
+		return ""
+	}
+	if timeout <= 0 || timeout > quotaMaxTimeout {
+		timeout = quotaMaxTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := bridge.Do(ctx, pluginapi.HTTPRequest{
+		Method: http.MethodPost,
+		URL:    base + accountMePath,
+		Headers: http.Header{
+			"Authorization": []string{"Bearer " + key},
+			"Accept":        []string{"application/json"},
+			"Content-Type":  []string{"application/json"},
+		},
+		// /api/me takes no parameters; the official clients POST an empty
+		// JSON object, and some proxies reject a bodyless POST.
+		Body: []byte("{}"),
+	})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var me accountMeResponse
+	if json.Unmarshal(resp.Body, &me) != nil {
+		return ""
+	}
+	label := strings.TrimSpace(me.Email)
+	if label == "" {
+		label = strings.TrimSpace(me.Name)
+	}
+	m.rememberAccountLabel(key, label)
+	return label
+}
+
 func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	if req.Method == http.MethodGet && req.Path == "/v0/resource/plugins/"+pluginName+"/quota" {
 		return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}}, Body: []byte(resources.QuotaPage)}, nil
@@ -180,21 +282,25 @@ func (m *Manager) HandleManagement(ctx context.Context, req pluginapi.Management
 		// 10 req/min account rate limit.
 		cards := make([]quotaCard, 0, len(keys))
 		for _, key := range keys {
-			id, label := quotaIdentity(key.Value)
-			cards = append(cards, quotaCard{KeyID: id, Label: label})
+			id, _ := quotaIdentity(key.Value)
+			cards = append(cards, quotaCard{KeyID: id, Label: m.credentialLabel(key.Value)})
 		}
 		return quotaJSON(quotaList{Cards: cards})
 	}
 	for _, key := range keys {
-		id, label := quotaIdentity(key.Value)
+		id, _ := quotaIdentity(key.Value)
 		if id != body.KeyID {
 			continue
 		}
-		usage, err := fetchQuota(ctx, m.bridge, baseURL, timeout, key.Value)
+		usage, err := m.fetchQuota(ctx, m.bridge, baseURL, timeout, key.Value)
+		label := m.credentialLabel(key.Value)
+		if usage.AccountLabel != "" {
+			label = usage.AccountLabel
+		}
 		if err != nil {
 			// One unreachable or unsupported account must not blank the
 			// whole page: the card carries the failure so the others still
-			// render, and the credential hash stays as the label.
+			// render, and the cached label (or credential hash) stays.
 			return quotaJSON(quotaCard{KeyID: id, Label: label, Error: err.Error()})
 		}
 		return quotaJSON(quotaCard{KeyID: id, Label: label, Usage: &usage})
@@ -244,7 +350,7 @@ func localBaseURL(baseURL string) bool {
 // window meters come from /api/balance, and the recent consumption totals
 // from /api/usage. The usage call is best-effort — a snapshot with balance
 // but without usage totals is still complete for the page's purposes.
-func fetchQuota(ctx context.Context, bridge *HostBridge, baseURL string, timeout time.Duration, key string) (quotaUsage, error) {
+func (m *Manager) fetchQuota(ctx context.Context, bridge *HostBridge, baseURL string, timeout time.Duration, key string) (quotaUsage, error) {
 	if bridge == nil {
 		return quotaUsage{}, fmt.Errorf("account bridge unavailable")
 	}
@@ -260,6 +366,7 @@ func fetchQuota(ctx context.Context, bridge *HostBridge, baseURL string, timeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	accountLabel := m.probeAccountLabel(ctx, bridge, base, timeout, key)
 	get := func(path string) ([]byte, http.Header, error) {
 		resp, errDo := bridge.Do(ctx, pluginapi.HTTPRequest{
 			Method: http.MethodGet,
@@ -288,7 +395,7 @@ func fetchQuota(ctx context.Context, bridge *HostBridge, baseURL string, timeout
 		// is the difference between a one-minute and a one-hour diagnosis.
 		return quotaUsage{}, fmt.Errorf("account balance response invalid: %v", err)
 	}
-	usage := quotaUsage{RefreshedAt: time.Now().UTC().Format(time.RFC3339)}
+	usage := quotaUsage{RefreshedAt: time.Now().UTC().Format(time.RFC3339), AccountLabel: accountLabel}
 	usage.Rows, usage.Metrics, usage.BalanceUSD, usage.PurchasedUSD = balanceRows(balance)
 
 	// Usage totals (best-effort): a wrong range/scope parameter is rejected

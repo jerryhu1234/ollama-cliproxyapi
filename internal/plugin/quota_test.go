@@ -78,15 +78,18 @@ func TestQuotaRefresh(t *testing.T) {
 			URL     string      `json:"url"`
 			Headers http.Header `json:"headers"`
 		}
-		if err := json.Unmarshal(payload, &wire); err != nil || wire.Method != http.MethodGet || wire.Headers.Get("Authorization") != "Bearer "+key || wire.Headers.Get("Accept") != "application/json" {
+		if err := json.Unmarshal(payload, &wire); err != nil || wire.Headers.Get("Authorization") != "Bearer "+key || wire.Headers.Get("Accept") != "application/json" {
 			t.Fatalf("bad quota request: %s", payload)
 		}
 		seen[wire.URL]++
 		switch {
-		case wire.URL == "https://quota.test/api/balance":
+		case wire.Method == http.MethodPost && wire.URL == "https://quota.test/api/me":
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
+				`{"email":"quota@example.test","name":"Quota User"}`)}), nil
+		case wire.Method == http.MethodGet && wire.URL == "https://quota.test/api/balance":
 			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
 				`{"included":{"balance_usd":72.5,"allowance_usd":100,"period":{"from":"2026-10-01T00:00:00Z","until":"2026-10-31T00:00:00Z"}},"purchased":{"balance_usd":25}}`)}), nil
-		case strings.HasPrefix(wire.URL, "https://quota.test/api/usage?"):
+		case wire.Method == http.MethodGet && strings.HasPrefix(wire.URL, "https://quota.test/api/usage?"):
 			if !strings.Contains(wire.URL, "range=24h") || !strings.Contains(wire.URL, "scope=self") {
 				t.Fatalf("usage query = %q", wire.URL)
 			}
@@ -112,7 +115,7 @@ func TestQuotaRefresh(t *testing.T) {
 	if got.Error != "" {
 		t.Fatalf("unexpected card error: %q", got.Error)
 	}
-	if got.Label != "Ollama credential "+mustHashPrefix(key) {
+	if got.Label != "quota@example.test" {
 		t.Errorf("label = %q", got.Label)
 	}
 	if got.Usage == nil {
@@ -156,8 +159,128 @@ func TestQuotaRefresh(t *testing.T) {
 			t.Errorf("%s called %d times, want 1", url, calls)
 		}
 	}
-	if len(seen) != 2 {
+	if len(seen) != 3 {
 		t.Errorf("endpoints called = %v", seen)
+	}
+}
+
+// The account email is a display concern, not a billing reading: one
+// /api/me probe per credential is enough, and the cached label keeps both
+// later refreshes and the list endpoint off the account rate limit.
+func TestQuotaAccountEmailIsCachedAndSharedWithList(t *testing.T) {
+	const key = "quota-email-cache-secret"
+	meCalls := 0
+	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		var wire struct {
+			Method string `json:"method"`
+			URL    string `json:"url"`
+		}
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			t.Fatalf("decode host request: %v", err)
+		}
+		switch {
+		case wire.Method == http.MethodPost && wire.URL == "https://quota.test/api/me":
+			meCalls++
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
+				`{"email":"cached@example.test"}`)}), nil
+		case wire.Method == http.MethodGet && wire.URL == "https://quota.test/api/balance":
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
+				`{"included":{"balance_usd":1,"allowance_usd":2}}`)}), nil
+		case wire.Method == http.MethodGet && strings.HasPrefix(wire.URL, "https://quota.test/api/usage?"):
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusNotFound, Body: []byte(`{}`)}), nil
+		}
+		t.Fatalf("unexpected URL %q method %q", wire.URL, wire.Method)
+		return nil, nil
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	m.cfg = config.Config{BaseURL: "https://quota.test", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
+	id, _ := quotaIdentity(key)
+	refresh := func() quotaCard {
+		t.Helper()
+		resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var card quotaCard
+		if err := json.Unmarshal(resp.Body, &card); err != nil {
+			t.Fatal(err)
+		}
+		if card.Error != "" || card.Usage == nil {
+			t.Fatalf("card = %+v", card)
+		}
+		return card
+	}
+	if got := refresh(); got.Label != "cached@example.test" {
+		t.Fatalf("first label = %q", got.Label)
+	}
+	if got := refresh(); got.Label != "cached@example.test" {
+		t.Fatalf("second label = %q", got.Label)
+	}
+	if meCalls != 1 {
+		t.Fatalf("/api/me calls = %d, want 1 (cached)", meCalls)
+	}
+
+	before := len(f.callsOf(pluginabi.MethodHostHTTPDo))
+	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list quotaList
+	if err := json.Unmarshal(resp.Body, &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Cards) != 1 || list.Cards[0].Label != "cached@example.test" {
+		t.Fatalf("list = %+v", list.Cards)
+	}
+	if after := len(f.callsOf(pluginabi.MethodHostHTTPDo)); after != before {
+		t.Fatalf("list made %d upstream calls", after-before)
+	}
+}
+
+// A failed identity probe must never blank a healthy quota card: the
+// credential hash remains the label and the billing snapshot still renders.
+func TestQuotaAccountEmailFailureKeepsCredentialFallback(t *testing.T) {
+	const key = "quota-email-fail-secret"
+	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		var wire struct {
+			Method string `json:"method"`
+			URL    string `json:"url"`
+		}
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			t.Fatalf("decode host request: %v", err)
+		}
+		switch {
+		case wire.Method == http.MethodPost && wire.URL == "https://quota.test/api/me":
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusUnauthorized, Body: []byte(`{"error":"unauthorized"}`)}), nil
+		case wire.Method == http.MethodGet && wire.URL == "https://quota.test/api/balance":
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
+				`{"included":{"balance_usd":1,"allowance_usd":2}}`)}), nil
+		default:
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusNotFound, Body: []byte(`{}`)}), nil
+		}
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	m.cfg = config.Config{BaseURL: "https://quota.test", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
+	id, _ := quotaIdentity(key)
+	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var card quotaCard
+	if err := json.Unmarshal(resp.Body, &card); err != nil {
+		t.Fatal(err)
+	}
+	if card.Error != "" || card.Usage == nil {
+		t.Fatalf("card = %+v, want a healthy snapshot", card)
+	}
+	if want := "Ollama credential " + mustHashPrefix(key); card.Label != want {
+		t.Fatalf("label = %q, want the credential fallback %q", card.Label, want)
 	}
 }
 
@@ -168,10 +291,15 @@ func TestQuotaRefreshLegacyPercentShape(t *testing.T) {
 			return hostOK(map[string]any{}), nil
 		}
 		var wire struct {
-			URL string `json:"url"`
+			Method string `json:"method"`
+			URL    string `json:"url"`
 		}
 		_ = json.Unmarshal(payload, &wire)
-		if wire.URL == "https://quota.test/api/balance" {
+		if wire.Method == http.MethodPost && wire.URL == "https://quota.test/api/me" {
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
+				`{"email":"legacy@example.test"}`)}), nil
+		}
+		if wire.Method == http.MethodGet && wire.URL == "https://quota.test/api/balance" {
 			// Legacy plan shape: rolling windows as remaining percentages.
 			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(
 				`{"included":{"session":{"remaining_percent":40,"resets_at":"2026-10-09T20:00:00Z"},"weekly":{"remaining_percent":0,"resets_at":"2026-10-13T00:00:00Z"}}}`)}), nil

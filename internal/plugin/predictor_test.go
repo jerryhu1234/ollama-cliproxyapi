@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 
+	"ollama-cliproxyapi/internal/config"
 	"ollama-cliproxyapi/internal/predictor"
 )
 
@@ -207,6 +208,44 @@ func TestPredictorLifecycle(t *testing.T) {
 	}
 	if calls := f.callsOf(pluginabi.MethodHostHTTPDo); predictorFetches(calls) > 0 {
 		t.Fatalf("lifecycle produced predictor upstream calls")
+	}
+}
+
+// The prediction view carries the same account identity as the quota card:
+// the email probe is shared through the manager cache, so a single /api/me
+// call labels every snapshot until it expires.
+func TestPredictorSnapshotUsesAccountEmail(t *testing.T) {
+	const key = "predictor-email-secret"
+	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		var wire struct {
+			Method string `json:"method"`
+			URL    string `json:"url"`
+		}
+		if err := json.Unmarshal(payload, &wire); err != nil {
+			t.Fatalf("decode host request: %v", err)
+		}
+		switch {
+		case wire.Method == http.MethodPost && wire.URL == "https://quota.test/api/me":
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"email":"predictor@example.test"}`)}), nil
+		case wire.Method == http.MethodGet && wire.URL == "https://quota.test/api/balance":
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"included":{"balance_usd":1,"allowance_usd":2}}`)}), nil
+		case wire.Method == http.MethodGet && strings.HasPrefix(wire.URL, "https://quota.test/api/usage?"):
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{}`)}), nil
+		}
+		t.Fatalf("unexpected URL %q method %q", wire.URL, wire.Method)
+		return nil, nil
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	m.cfg = config.Config{BaseURL: "https://quota.test", RequestTimeout: time.Second}
+	snap, err := m.fetchPredictorSnapshot(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Label != "predictor@example.test" {
+		t.Fatalf("snapshot label = %q", snap.Label)
 	}
 }
 

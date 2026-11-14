@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,8 @@ func quotaProviderFixture(t *testing.T) (*Manager, *fakeCaller) {
 		}
 		var body string
 		switch {
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL, "/api/me"):
+			body = `{"email":"provider@example.test"}`
 		case strings.HasSuffix(req.URL, "/api/balance"):
 			body = `{"included":{"balance_usd":72.5,"allowance_usd":100,"period":{"from":"2026-10-01T00:00:00Z","until":"2026-10-31T00:00:00Z"}},"purchased":{"balance_usd":25}}`
 		case strings.Contains(req.URL, accountUsagePath+"?"):
@@ -146,7 +149,7 @@ func TestQuotaProviderNativeAndLegacyNormalizationMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := fetchQuota(context.Background(), m.bridge.withHostCallbackID("quota-callback"), m.cfg.BaseURL, m.cfg.RequestTimeout, quotaProviderSecret)
+	legacy, err := m.fetchQuota(context.Background(), m.bridge.withHostCallbackID("quota-callback"), m.cfg.BaseURL, m.cfg.RequestTimeout, quotaProviderSecret)
 	if err != nil {
 		t.Fatal(err)
 	}

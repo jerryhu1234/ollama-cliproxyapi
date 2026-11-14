@@ -59,6 +59,19 @@ type Manager struct {
 	// when no loop is running.
 	stop chan struct{}
 	done chan struct{}
+
+	// labelMu guards labelCache, the account display label (email) per key
+	// digest. It is separate from mu so config reads never serialize label
+	// lookups on the quota/prediction hot paths.
+	labelMu    sync.Mutex
+	labelCache map[string]labelEntry
+}
+
+// labelEntry is one cached account display label. Identity changes rarely,
+// so the TTL keeps the extra /api/me probe off every balance snapshot.
+type labelEntry struct {
+	label     string
+	fetchedAt time.Time
 }
 
 // NewManager returns a dispatcher whose outbound traffic flows through bridge.

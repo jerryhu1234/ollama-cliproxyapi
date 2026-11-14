@@ -87,7 +87,11 @@ func (m *Manager) fetchPredictorSnapshot(ctx context.Context, key string) (predi
 	if err != nil {
 		return predictor.AccountSnapshot{}, err
 	}
-	id, label := quotaIdentity(key)
+	id, fallbackLabel := quotaIdentity(key)
+	label := fallbackLabel
+	if email := m.probeAccountLabel(ctx, m.bridge, base, quotaMaxTimeout, key); email != "" {
+		label = email
+	}
 	snap := predictor.AccountSnapshot{
 		KeyID: id, Label: label, At: time.Now().UTC(), PurchasedUSD: -1,
 	}

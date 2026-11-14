@@ -28,6 +28,9 @@ CLIProxyAPI（CPA）原生 Go 插件：把 **Ollama**（云端 ollama.com 或本
     兼容旧版计划（`included.session / weekly` 的 `remaining_percent / resets_at`）。
   - `GET https://ollama.com/api/usage?range=24h&scope=self` → 请求数、用量 USD、
     输入/缓存输入/输出 token 合计。
+  - `POST https://ollama.com/api/me`（Bearer key）→ 账号邮箱，用作卡片标题；
+    邮箱为空时回退到账号名，再回退到 key 哈希。该结果缓存 12 小时，正常情况下
+    不增加余额快照的上游调用次数。
   - 注意上游限制：账户接口 **10 req/min/user**（429 + Retry-After），页面已做缓存与节流；
     均衡卡片在本地模式（localhost）自动禁用。
 - **不支持的调用**：`count_tokens`、插件级 `http_request` 返回明确的 unsupported 错误。
@@ -150,7 +153,8 @@ protocols:
   （**不移交** `x-api-key`——Ollama 云端不接受）。
 - 移除了模板的会话派生/`x-commandcode-session` 头逻辑（Ollama 无此概念）。
 - 额度：`/api/balance` + `/api/usage`（模板是 `/alpha/billing/*` + `/alpha/whoami`）；
-  无邮箱同步（Ollama 没有 whoami 概念），卡片标签用 key 哈希前 12 位。
+  账号身份用官方桌面端同款的 `POST /api/me` 获取邮箱（`name` 兜底），
+  失败时才回退到 key 哈希前 12 位。
 - QuotaProvider：`SupportsReset=false`（Ollama 不支持重置）。
 
 ## License

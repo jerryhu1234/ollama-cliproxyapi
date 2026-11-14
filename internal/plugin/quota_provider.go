@@ -57,7 +57,7 @@ func (p quotaProvider) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchR
 	p.manager.mu.RLock()
 	baseURL, timeout := p.manager.cfg.BaseURL, p.manager.cfg.RequestTimeout
 	p.manager.mu.RUnlock()
-	usage, err := fetchQuota(ctx, bridge, baseURL, timeout, key)
+	usage, err := p.manager.fetchQuota(ctx, bridge, baseURL, timeout, key)
 	if err != nil {
 		return pluginapi.QuotaFetchResponse{}, err
 	}
