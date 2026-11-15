@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -86,40 +88,120 @@ func (f *SSEFramer) Next() (eventType, data string, raw []byte, ok bool) {
 }
 
 // RewriteModelID rewrites the top-level model field of a native-format
-// request body to the bare upstream ID. The body decodes ONCE one level
-// into json.RawMessage values, so every nested value passes through
-// byte-exact — notably large integers that a float64 roundtrip would
-// mangle (FR-005 fidelity). When the decoded model field's raw bytes
-// already equal the quoted upstream ID (the common bare-ID/prefix client
-// case), the original body is returned untouched before any mutation —
-// a pure no-op that skips the remarshal. The comparison target mirrors
-// the rewrite quoting below, and a decoded RawMessage always holds a
-// valid JSON value, so an upstream id that cannot be represented
-// (quotes/backslashes/control characters) can never match here and still
-// reaches the rewrite's error. Duplicate keys follow encoding/json
-// semantics: the LAST occurrence wins. formatLabel names the source
-// protocol in the malformed-JSON error.
+// request body to the bare upstream ID.
+//
+// The rewrite is a byte splice (sjson), never a decode/remarshal: every byte
+// outside the model value — field order, whitespace, nested numbers such as
+// large integers a float64 roundtrip would mangle (FR-005 fidelity) — passes
+// through exactly. A remarshal reordered the whole document alphabetically
+// and copied it, which both allocated a second multi-MB buffer per long
+// request and perturbed every byte of the prompt, plausibly defeating the
+// upstream's prompt-prefix cache.
+//
+// The common bare-ID/prefix case is a pure no-op: a body whose top-level
+// model already decodes to the upstream ID is returned untouched (same
+// backing array). formatLabel names the source protocol in the
+// malformed-JSON error.
+//
+// The old "model id cannot be represented as JSON" rejection is gone: it
+// existed because the rewrite concatenated `"`+id+`"`, so a quote or backslash
+// in a catalog id produced an invalid document. sjson JSON-encodes the value
+// (quotes, backslashes, control characters and non-ASCII all round-trip), so
+// every id is representable. The one remaining silent mutation is invalid
+// UTF-8 — encoding a Go string with a bad byte yields U+FFFD — and that is
+// rejected below, because sending a different model id than the catalog named
+// is worse than failing.
 func RewriteModelID(upstreamModel string, body []byte, formatLabel string) ([]byte, *errclass.Error) {
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, errclass.Translation("malformed " + formatLabel + " request JSON: " + err.Error())
+	if !utf8.ValidString(upstreamModel) {
+		return nil, errclass.Translation("model id is not valid UTF-8")
 	}
-	// A literal JSON null body unmarshals without error into a NIL map;
-	// assigning the model field would panic, so reject it as malformed.
-	if req == nil {
-		return nil, errclass.Translation("malformed request body: JSON null is not a valid request")
+	// A literal JSON null body, an array/scalar, and a syntax error are all
+	// malformed requests. Validation must precede the rewrite: sjson does not
+	// validate its input and happily "rewrites" a corrupt document (and turns
+	// a null body into {"model":...}), so the rejection cannot be recovered
+	// afterwards.
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return nil, malformedRequestJSON(body, formatLabel)
 	}
-	if raw, ok := req["model"]; ok && string(raw) == `"`+upstreamModel+`"` {
+	// sjson rewrites the FIRST matching key while the upstream (last-wins,
+	// like encoding/json) uses the LAST, so a body that repeats the top-level
+	// model key would end up with a stale later value — or, worse, would look
+	// like a no-op below while the upstream read the old id. That check must
+	// precede the no-op comparison for the same reason. Duplicate keys are
+	// pathological input, so they take the legacy decode path. The byte-count
+	// is only a gate (it also matches nested "model" properties and quoted
+	// mentions inside prompt text); the top-level scan decides, so a nested
+	// schema property keeps the byte-preserving fast path. A duplicate spelled
+	// with JSON escapes ("mo\u0064el") is not counted and would slip through —
+	// no JSON encoder emits that, and the alternative is an O(body) byte scan
+	// on every request.
+	if bytes.Count(body, []byte(`"model"`)) > 1 && countTopLevelModelKeys(body) > 1 {
+		return rewriteModelIDLastWins(upstreamModel, formatLabel, body)
+	}
+	if raw := gjson.GetBytes(body, "model"); raw.Type == gjson.String && raw.Str == upstreamModel {
 		return body, nil
 	}
-	req["model"] = json.RawMessage(`"` + upstreamModel + `"`)
-	b, err := json.Marshal(req)
+	out, err := sjson.SetBytes(body, "model", upstreamModel)
 	if err != nil {
-		// A catalog model id containing quotes/backslashes/control
-		// characters cannot be represented as a JSON string value.
-		return nil, errclass.Translation("model id cannot be represented as JSON")
+		return nil, errclass.Translation("malformed " + formatLabel + " request JSON: " + err.Error())
 	}
-	return b, nil
+	return out, nil
+}
+
+// countTopLevelModelKeys counts the direct members of the top-level object
+// named "model" (nested ones are not visited). It only runs for bodies that
+// mention "model" more than once.
+func countTopLevelModelKeys(body []byte) int {
+	n := 0
+	gjson.ParseBytes(body).ForEach(func(key, _ gjson.Result) bool {
+		if key.Str == "model" {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+// malformedRequestJSON renders the rejection for a body that is not a JSON
+// object. It runs the pre-sjson decode only to reproduce encoding/json's own
+// syntax-error text (callers and tests key off it), and to spell out the
+// top-level-null case: a literal null unmarshals without error into a NIL
+// map, and sjson would silently turn it into {"model":...} instead.
+func malformedRequestJSON(body []byte, formatLabel string) *errclass.Error {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return errclass.Translation("malformed " + formatLabel + " request JSON: " + err.Error())
+	}
+	if req == nil {
+		return errclass.Translation("malformed request body: JSON null is not a valid request")
+	}
+	// Unreachable for the gate above (a valid JSON object passes it), kept so
+	// an unclassified body can never be forwarded as if it were rewritten.
+	return errclass.Translation("malformed " + formatLabel + " request JSON: body is not a JSON object")
+}
+
+// rewriteModelIDLastWins is the legacy decode/remarshal kernel, retained only
+// for bodies that repeat the top-level model key: encoding/json keeps the
+// LAST occurrence, and remarshalling collapses the duplicates to one value.
+// The model value is JSON-encoded rather than concatenated, so an id
+// containing quotes/backslashes/control characters is escaped correctly here
+// exactly as sjson escapes it on the fast path.
+func rewriteModelIDLastWins(upstreamModel, formatLabel string, body []byte) ([]byte, *errclass.Error) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil || req == nil {
+		return nil, malformedRequestJSON(body, formatLabel)
+	}
+	quoted, err := json.Marshal(upstreamModel)
+	if err != nil {
+		return nil, errclass.Translation("malformed " + formatLabel + " request JSON: model id is not encodable")
+	}
+	req["model"] = json.RawMessage(quoted)
+	out, err := json.Marshal(req)
+	if err != nil {
+		return nil, errclass.Translation("malformed " + formatLabel + " request JSON: " + err.Error())
+	}
+	return out, nil
 }
 
 // HasContent reports whether a raw content/instructions/arguments field is
@@ -1037,11 +1119,61 @@ const snippetBound = 4096
 // its head before redacted-snippet extraction, then classified per §7 via
 // errclass.FromStatus. One kernel keeps bounding and redaction from
 // diverging across call sites.
+//
+// Cloudflare challenges: ollama.com is fronted by Cloudflare, whose 403
+// interstitial puts its markers ("Just a moment...", "challenge-platform")
+// deep in the HTML — past the 80-character snippet. This kernel is the last
+// boundary still holding the upstream text, so it scans the bounded full head
+// for the markers and, when they are present, asks the classifier for the
+// challenge treatment (ClassUpstream + retryable + "cloudflare challenge: "
+// prefix). The snippet itself is never widened (FR-011): the host only needs
+// the phrase, which it routes into a short backoff. A plain 403 keeps the
+// auth-failure classification.
 func UpstreamStatusError(status int, body []byte) *errclass.Error {
 	if len(body) > snippetBound {
 		body = body[:snippetBound]
 	}
-	return errclass.FromStatus(status, RedactedSnippet(string(body)))
+	full := string(body)
+	msg := RedactedSnippet(full)
+	// The markers sit past the snippet, so the classifier would only see
+	// plain HTML. Hand it the host phrase instead — the snippet itself is not
+	// widened (FR-011); errclass.FromStatus owns the reclassification.
+	if status == http.StatusForbidden && errclass.IsCloudflareChallengeText(full) &&
+		!strings.Contains(strings.ToLower(msg), "cloudflare challenge") {
+		msg = "cloudflare challenge: " + msg
+	}
+	return errclass.FromStatus(status, msg)
+}
+
+// RetryAfterSeconds parses the delta-seconds form of an upstream Retry-After
+// header for the wire retry hint. Only delta-seconds is accepted: an HTTP-date
+// cannot be interpreted without clock-skew risk, so it degrades to "no hint"
+// rather than to a wrong cooldown. Values are floored to positive ints and
+// capped at an hour so a buggy upstream cannot pin a credential indefinitely.
+func RetryAfterSeconds(headers http.Header) int {
+	if headers == nil {
+		return 0
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(headers.Get("Retry-After")))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	if secs > 3600 {
+		return 3600
+	}
+	return secs
+}
+
+// UpstreamStatusErrorWithHeaders is UpstreamStatusError plus the upstream
+// response's Retry-After guidance: the host's conductor times the credential
+// cooldown from RetryAfterSeconds and mirrors it into the client response
+// header, so a 429 refusal must not be re-treated as an untimed burn.
+func UpstreamStatusErrorWithHeaders(status int, body []byte, headers http.Header) *errclass.Error {
+	e := UpstreamStatusError(status, body)
+	if e != nil {
+		e.RetryAfterSeconds = RetryAfterSeconds(headers)
+	}
+	return e
 }
 
 // ResponsesUsage is the token-usage block of synthesized Responses
@@ -1892,8 +2024,12 @@ func OpenAIImageURL(raw json.RawMessage) (string, *errclass.Error) {
 // adapter handles, naming the target endpoint.
 func UnsupportedFormat(format, target string) *errclass.Error {
 	return &errclass.Error{
-		Class:   errclass.ClassUnsupported,
-		Message: fmt.Sprintf("source protocol %q cannot be translated to %s", format, target),
+		Class: errclass.ClassUnsupported,
+		// 422: the request body uses a source protocol the target endpoint
+		// cannot represent — request-scoped, so the host must exempt it
+		// from credential cooldown/rotation.
+		StatusCode: 422,
+		Message:    fmt.Sprintf("source protocol %q cannot be translated to %s", format, target),
 	}
 }
 
@@ -1901,8 +2037,12 @@ func UnsupportedFormat(format, target string) *errclass.Error {
 // endpoint cannot represent (ClassUnsupported; FR-005 explicit policy).
 func UnsupportedPartType(partType, target string) *errclass.Error {
 	return &errclass.Error{
-		Class:   errclass.ClassUnsupported,
-		Message: fmt.Sprintf("unsupported content block type %q for %s", partType, target),
+		Class: errclass.ClassUnsupported,
+		// 422: a client content-block/part type the endpoint cannot
+		// represent is request-scoped; an explicit status keeps the host
+		// from reading it as a 500 credential failure.
+		StatusCode: 422,
+		Message:    fmt.Sprintf("unsupported content block type %q for %s", partType, target),
 	}
 }
 

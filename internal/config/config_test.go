@@ -230,6 +230,56 @@ func TestLoadEnvExpansion(t *testing.T) {
 	}
 }
 
+// TestLoadTrimsAPIKeyValues pins key trimming AFTER ${ENV} expansion: quoted
+// scalars and block scalars carry a trailing newline, and the auth-record
+// identity is sha256(raw value), so an untrimmed variant would materialize a
+// SECOND credential card for the same account. Trimmed-empty falls into the
+// existing expanded-to-empty rejection and trimmed-equal hits the existing
+// duplicate check, so neither needs a new code path.
+func TestLoadTrimsAPIKeyValues(t *testing.T) {
+	t.Run("trailing newline from block scalar", func(t *testing.T) {
+		c, err := Load([]byte("api-keys:\n  - value: |\n      sk-block-scalar\n"))
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "sk-block-scalar" {
+			t.Fatalf("APIKeys = %+v, want the trailing newline trimmed", c.APIKeys)
+		}
+	})
+
+	t.Run("quoted value with surrounding whitespace", func(t *testing.T) {
+		// Double quotes preserve inner whitespace, unlike plain scalars.
+		c, err := Load([]byte("api-keys:\n  - value: \"  sk-quoted  \"\n"))
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "sk-quoted" {
+			t.Fatalf("APIKeys = %+v, want the padding trimmed", c.APIKeys)
+		}
+	})
+
+	t.Run("env expansion carries a newline", func(t *testing.T) {
+		t.Setenv("TEST_OG_NEWLINE_KEY", "sk-env-scalar\n")
+		c, err := Load([]byte("api-keys:\n  - value: ${TEST_OG_NEWLINE_KEY}\n"))
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if len(c.APIKeys) != 1 || c.APIKeys[0].Value != "sk-env-scalar" {
+			t.Fatalf("APIKeys = %+v, want the expanded newline trimmed", c.APIKeys)
+		}
+	})
+
+	t.Run("whitespace-only value is rejected as empty", func(t *testing.T) {
+		_, err := Load([]byte("api-keys:\n  - value: \"   \"\n"))
+		requireErrContains(t, err, "api-keys[0].value: expanded to empty")
+	})
+
+	t.Run("duplicate after trim is rejected", func(t *testing.T) {
+		_, err := Load([]byte("api-keys:\n  - value: sk-dup-trim\n  - value: |\n      sk-dup-trim\n"))
+		requireErrContains(t, err, "api-keys: duplicate key values are not allowed")
+	})
+}
+
 func TestLoadIgnoresRemovedSchedulerFields(t *testing.T) {
 	doc := "routing:\n  strategy: round-robin\n  max-retries-per-request: 9\n  transient-retry-interval: 1s\n  fallback-cooldown: 1m\n" +
 		"api-keys:\n  - value: sk-dummy\n    priority: 7\n"

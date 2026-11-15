@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/catalog"
 	"ollama-cliproxyapi/internal/config"
@@ -94,20 +94,54 @@ func twoKeyFixture(t *testing.T) (config.Config, *catalog.Manager, *HostBridge, 
 	return cfg, catalog.New(cfg, bridge), bridge, rec
 }
 
-// TestRefreshUsesFirstConfiguredKey pins the Phase 5 fallback: catalog refresh
-// uses the deterministic first configured key and does not try another
-// configured key when that key fails.
-func TestRefreshUsesFirstConfiguredKey(t *testing.T) {
+// TestRefreshFailsOverAcrossConfiguredKeys pins the failover contract: a
+// failing first key must NOT pin the catalog — refresh walks every configured
+// key and the first success wins. (Deliberately replaces the old
+// "first-key-only" pin, which left the whole model list dead whenever that one
+// key was revoked.) The per-key failure is logged, and the successful key's
+// snapshot is installed.
+func TestRefreshFailsOverAcrossConfiguredKeys(t *testing.T) {
 	cfg, mgr, bridge, rec := twoKeyFixture(t)
-	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err == nil {
-		t.Fatal("expected first configured key failure")
+	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err != nil {
+		t.Fatalf("refreshOnce must succeed via the second key: %v", err)
 	}
 	auths := rec.seen()
-	if len(auths) != 1 || auths[0] != "Bearer "+cooledRefreshKey {
-		t.Fatalf("refresh auths = %v; want one first-key attempt", auths)
+	if len(auths) != 2 || auths[0] != "Bearer "+cooledRefreshKey || auths[1] != "Bearer "+goodRefreshKey {
+		t.Fatalf("refresh auths = %v; want first key then second key", auths)
 	}
-	if len(mgr.Models()) != 0 {
-		t.Fatalf("failed refresh changed catalog: %+v", mgr.Models())
+	if len(mgr.Models()) == 0 {
+		t.Fatal("failover success installed no models")
+	}
+	var sawPerKey bool
+	for _, raw := range rec.logCalls() {
+		if strings.Contains(string(raw), "trying next configured key") {
+			sawPerKey = true
+		}
+	}
+	if !sawPerKey {
+		t.Fatal("per-key failure must log a warn naming the retry")
+	}
+}
+
+// TestRefreshWithoutKeysFailsLocally pins the local length guard: config
+// validation is a cross-package invariant, so refreshOnce must not index
+// APIKeys[0] on a directly-built Config. It errors instead of panicking and
+// makes no host call at all.
+func TestRefreshWithoutKeysFailsLocally(t *testing.T) {
+	cfg, err := config.Load([]byte("api-keys:\n  - value: sk-refresh-good-key\n" +
+		"catalog-url: https://catalog.test/models\n"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	rec := &authRecorder{}
+	bridge := NewHostBridge(rec.call)
+	mgr := catalog.New(cfg, bridge)
+	cfg.APIKeys = nil
+	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err == nil {
+		t.Fatal("refresh without keys must fail")
+	}
+	if got := len(rec.seen()); got != 0 {
+		t.Fatalf("refresh without keys issued %d host calls, want 0", got)
 	}
 }
 

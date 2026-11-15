@@ -587,34 +587,105 @@ func (p *persister) load(sink func(persistRecord)) (int, error) {
 func (p *persister) append(recs []persistRecord) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// The data dir is created before the lock file is opened so a vanished
+	// dir self-heals instead of turning every later flush into a warning.
 	if err := os.MkdirAll(filepath.Dir(p.path), 0o755); err != nil {
 		return err
 	}
+	unlock, err := p.lockSharedPath()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	f, err := os.OpenFile(p.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	_, err = f.Write(EncodeRecords(recs))
-	return err
+	if err != nil {
+		return err
+	}
+	// Crash durability: samples survive a hard kill only if the bytes reach
+	// disk; O_APPEND+fsync costs one sync per flush tick (defaults ride a
+	// 5-minute cadence + one shutdown flush, not per sample). The contract
+	// "a hard kill loses at most one flush window" depends on this.
+	return f.Sync()
 }
 
-// rewrite replaces the file atomically (tmp + rename) — the compaction
-// path, also used right after a restore so the file stops growing.
+// lockSharedPath serializes writers on one history file across overlapping
+// engines: Stop joins goroutines within the engine's own budget, but a
+// reconfigure that gives up still leaves the retired engine flushing while
+// the fresh engine compacts — an exclusive lock on the sidecar lock file
+// makes each append/rewrite critical section atomic.
+//
+// Discipline: a fresh open file description per critical section (so it
+// contends between goroutines of one process too, not just between
+// processes), held for exactly the one write, then unlocked and closed. The
+// lock file itself is never removed — unlinking it would let a third writer
+// lock a different inode and defeat the mutual exclusion. Callers must not
+// nest lockSharedPath (each call takes a new description, so re-entry would
+// self-deadlock); every caller here takes it exactly once.
+func (p *persister) lockSharedPath() (func(), error) {
+	lockPath := p.path + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return func() {}, err
+	}
+	unlock, err := lockFileDesc(lf, lockPath)
+	if err != nil {
+		_ = lf.Close()
+		return func() {}, err
+	}
+	return func() {
+		unlock()
+		_ = lf.Close()
+	}, nil
+}
+
+// rewrite replaces the file atomically (unique tmp + fsync + rename) — the
+// compaction path, also used right after a restore so the file stops
+// growing. The tmp name is deliberately unique per call: two overlapping
+// writers sharing a fixed tmp name truncate each other's payloads and the
+// loser's rename fails ENOENT once the winner moved it.
 func (p *persister) rewrite(recs []persistRecord) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(p.path), 0o755); err != nil {
 		return err
 	}
-	tmp := p.path + ".tmp"
-	if err := os.WriteFile(tmp, EncodeRecords(recs), 0o600); err != nil {
-		_ = os.Remove(tmp) // D10: no stray half-written temp files left behind
+	unlock, err := p.lockSharedPath()
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, p.path); err != nil {
-		_ = os.Remove(tmp)
+	defer unlock()
+	tmp, err := os.CreateTemp(filepath.Dir(p.path), filepath.Base(p.path)+".*.tmp")
+	if err != nil {
 		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }() // D10: no stray half-written temp files
+	if _, err := tmp.Write(EncodeRecords(recs)); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	// fsync the payload before the rename: after a crash the renamed file
+	// must never hold the old name's metadata pointing at zeroed blocks.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, p.path); err != nil {
+		return err
+	}
+	// Persist the rename itself so the new history is visible after reboot
+	// (best effort: failure here loses durability, not correctness).
+	if dirf, derr := os.Open(filepath.Dir(p.path)); derr == nil {
+		_ = dirf.Sync()
+		_ = dirf.Close()
 	}
 	return nil
 }

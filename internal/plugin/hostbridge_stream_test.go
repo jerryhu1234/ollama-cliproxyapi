@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func decodePayload(t *testing.T, c capturedCall) map[string]any {
@@ -38,7 +38,7 @@ func TestBridgeDoStream(t *testing.T) {
 		URL:     "https://up.test/v1/chat/completions",
 		Headers: http.Header{"Authorization": []string{"Bearer " + testKey}},
 		Body:    []byte(`{"model":"glm-5.3"}`),
-	})
+	}, "op-7")
 	if err != nil {
 		t.Fatalf("DoStream: %v", err)
 	}
@@ -54,6 +54,12 @@ func TestBridgeDoStream(t *testing.T) {
 		m["body"] != "eyJtb2RlbCI6ImdsbS01LjMifQ==" {
 		t.Fatalf("wire payload wrong: %v", m)
 	}
+	// The operation id must ride on the SAME envelope the host decodes into
+	// its HTTP request: that is what makes host.http.cancel able to abort this
+	// stream (pluginhost/host_callbacks.go decodeHostHTTPRequestWithOperationID).
+	if m["operation_id"] != "op-7" {
+		t.Fatalf("operation_id not forwarded on do_stream: %v", m)
+	}
 	hdrs := m["headers"].(map[string]any)
 	if hdrs["Authorization"].([]any)[0].(string) != "Bearer "+testKey {
 		t.Fatalf("headers wrong: %v", hdrs)
@@ -63,9 +69,63 @@ func TestBridgeDoStream(t *testing.T) {
 	f2 := &fakeCaller{responder: func(_ string, _ []byte) ([]byte, error) {
 		return []byte(`{"ok":true,"result":{"status_code":429}}`), nil
 	}}
-	status2, headers2, id2, err2 := NewHostBridge(f2.call).DoStream(context.Background(), pluginapi.HTTPRequest{})
+	status2, headers2, id2, err2 := NewHostBridge(f2.call).DoStream(context.Background(), pluginapi.HTTPRequest{}, "")
 	if err2 != nil || status2 != http.StatusTooManyRequests || headers2 != nil || id2 != "" {
 		t.Fatalf("bare start = %d %q %v %v", status2, id2, headers2, err2)
+	}
+}
+
+// TestBridgeOperationEnvelopeCarriesCallbackID pins the operation envelope
+// shape for a callback-scoped bridge. The host claims an operation with the
+// pair (operation_id, host_callback_id) and rejects the claim when the
+// callback ID differs from the one the operation was opened under
+// (pluginhost/http_operation_bridge.go claim), so open, do_stream, and cancel
+// must all carry the same host_callback_id.
+func TestBridgeOperationEnvelopeCarriesCallbackID(t *testing.T) {
+	const (
+		cbID = "cb-scoped"
+		opID = "op-scoped"
+	)
+	f := &fakeCaller{responder: func(method string, _ []byte) ([]byte, error) {
+		switch method {
+		case pluginabi.MethodHostHTTPOperationOpen:
+			return hostOK(hostOperationOpenResp{OperationID: opID}), nil
+		case pluginabi.MethodHostHTTPDoStream:
+			return hostOK(hostStreamStartResp{StatusCode: http.StatusOK, StreamID: "up-scoped"}), nil
+		case pluginabi.MethodHostHTTPCancel:
+			return hostOK(struct{}{}), nil
+		}
+		t.Fatalf("unexpected callback %q", method)
+		return nil, nil
+	}}
+	bridge := NewHostBridge(f.call).withHostCallbackID(cbID)
+
+	gotOp, err := bridge.OpenOperation(context.Background())
+	if err != nil || gotOp != opID {
+		t.Fatalf("OpenOperation = %q %v, want %q", gotOp, err, opID)
+	}
+	if _, _, _, err := bridge.DoStream(context.Background(), pluginapi.HTTPRequest{
+		Method: http.MethodPost,
+		URL:    "https://up.test/v1/chat/completions",
+		Body:   []byte(`{}`),
+	}, gotOp); err != nil {
+		t.Fatalf("DoStream: %v", err)
+	}
+	if err := bridge.CancelOperation(gotOp); err != nil {
+		t.Fatalf("CancelOperation: %v", err)
+	}
+
+	opened := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPOperationOpen)[0])
+	if opened["host_callback_id"] != cbID {
+		t.Fatalf("operation_open did not carry the callback id: %v", opened)
+	}
+	stream := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPDoStream)[0])
+	if stream["operation_id"] != opID || stream["host_callback_id"] != cbID {
+		t.Fatalf("do_stream envelope must carry operation_id and host_callback_id: %v", stream)
+	}
+	cancelled := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPCancel)[0])
+	if cancelled["operation_id"] != opID || cancelled["host_callback_id"] != cbID {
+		t.Fatalf("cancel envelope must carry operation_id and host_callback_id: %v", cancelled)
 	}
 }
 
@@ -82,7 +142,7 @@ func TestBridgeDoStreamFailures(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, _, err := NewHostBridge((&fakeCaller{responder: tc.respond}).call).
-				DoStream(context.Background(), pluginapi.HTTPRequest{})
+				DoStream(context.Background(), pluginapi.HTTPRequest{}, "")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
 				t.Fatalf("err = %v, want substring %q", err, tc.wantSub)
 			}
@@ -106,7 +166,7 @@ func TestBridgeDoStreamLateStreamClosed(t *testing.T) {
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, _, _, err := NewHostBridge(f.call).DoStream(ctx, pluginapi.HTTPRequest{}); err == nil ||
+	if _, _, _, err := NewHostBridge(f.call).DoStream(ctx, pluginapi.HTTPRequest{}, ""); err == nil ||
 		!strings.Contains(err.Error(), "host call host.http.do_stream timed out") {
 		t.Fatalf("late result must still surface as timeout: %v", err)
 	}
@@ -156,7 +216,7 @@ func TestBridgeDoStreamLateNoClose(t *testing.T) {
 			f := &fakeCaller{responder: tc.respond}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			defer cancel()
-			if _, _, _, err := NewHostBridge(f.call).DoStream(ctx, pluginapi.HTTPRequest{}); err == nil ||
+			if _, _, _, err := NewHostBridge(f.call).DoStream(ctx, pluginapi.HTTPRequest{}, ""); err == nil ||
 				!strings.Contains(err.Error(), "timed out") {
 				t.Fatalf("err = %v, want timeout", err)
 			}
@@ -193,7 +253,7 @@ func TestBridgeDoStreamAbandonedStreamClosedEventually(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	if _, _, _, err := NewHostBridge(f.call).DoStream(ctx, pluginapi.HTTPRequest{}); err == nil ||
+	if _, _, _, err := NewHostBridge(f.call).DoStream(ctx, pluginapi.HTTPRequest{}, ""); err == nil ||
 		!strings.Contains(err.Error(), "host call host.http.do_stream timed out") {
 		t.Fatalf("err = %v, want timeout", err)
 	}

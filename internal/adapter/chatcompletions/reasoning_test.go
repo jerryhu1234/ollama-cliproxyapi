@@ -290,3 +290,57 @@ func TestNonStreamReasoningTargets(t *testing.T) {
 		}
 	})
 }
+
+// TestPassthroughBackfillGating pins the hot-path optimization: the
+// reasoning mirror is gated on the decode already performed, so a chunk that
+// cannot be rewritten is forwarded without the extra gjson validation pass.
+// Correctness must be unchanged in every case — including the one where the
+// vendor spelling already carries a standard reasoning_content (the kernel
+// never overwrites it, so the gate must not fire either).
+func TestPassthroughBackfillGating(t *testing.T) {
+	cases := []struct {
+		name  string
+		chunk string
+		want  string
+	}{
+		{
+			name:  "vendor spelling mirrored",
+			chunk: `{"choices":[{"index":0,"delta":{"reasoning":"we"}}]}`,
+			want:  `{"choices":[{"index":0,"delta":{"reasoning":"we","reasoning_content":"we"}}]}`,
+		},
+		{
+			name:  "standard spelling already present",
+			chunk: `{"choices":[{"index":0,"delta":{"reasoning":"we","reasoning_content":"we"}}]}`,
+			want:  `{"choices":[{"index":0,"delta":{"reasoning":"we","reasoning_content":"we"}}]}`,
+		},
+		{
+			name:  "no reasoning fields",
+			chunk: `{"choices":[{"index":0,"delta":{"content":"2"}}]}`,
+			want:  `{"choices":[{"index":0,"delta":{"content":"2"}}]}`,
+		},
+		{
+			name:  "usage-only trailer",
+			chunk: `{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}}`,
+			want:  `{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}}`,
+		},
+		{
+			// Shape drift the typed decode rejects: the cold path must still
+			// mirror rather than drop thinking text.
+			name:  "undecodable choice still mirrored",
+			chunk: `{"choices":[{"index":0,"delta":{"reasoning":"we"},"finish_reason":7}]}`,
+			want:  `{"choices":[{"index":0,"delta":{"reasoning":"we","reasoning_content":"we"},"finish_reason":7}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := NewStreamConverter("openai")
+			evs, done, eErr := sc.Feed([]byte("data: " + tc.chunk + "\n"))
+			if eErr != nil || done || len(evs) != 1 {
+				t.Fatalf("feed: evs=%d done=%v err=%v", len(evs), done, eErr)
+			}
+			if string(evs[0]) != tc.want {
+				t.Fatalf("payload =\n got %s\nwant %s", evs[0], tc.want)
+			}
+		})
+	}
+}

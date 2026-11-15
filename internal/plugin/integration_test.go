@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/config"
 )
@@ -463,8 +463,8 @@ func TestRegisterAndDiscover(t *testing.T) {
 
 	var reg registrationResult
 	decodeResult(t, mustHandle(t, m, "plugin.register", lifecycleRequestBody(integrationYAML("http://unused.invalid"))), &reg)
-	if reg.SchemaVersion != pluginabi.SchemaVersion {
-		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	if reg.SchemaVersion != registeredSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, registeredSchemaVersion)
 	}
 	if !reg.Capabilities.ModelProvider || !reg.Capabilities.AuthProvider || !reg.Capabilities.Executor {
 		t.Fatalf("capabilities = %+v", reg.Capabilities)

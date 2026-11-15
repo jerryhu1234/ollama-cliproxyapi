@@ -128,7 +128,11 @@ func TestPassthroughFailedWithStatusCode(t *testing.T) {
 
 func TestPassthroughErrorEventFallback(t *testing.T) {
 	_, _, eErr := runStream(t, "openai-response", frame("error", `{"message":"boom"}`))
-	if eErr == nil || eErr.Class != errclass.ClassUpstream || !eErr.Retryable || eErr.StatusCode != 0 {
+	// The classification is the adapter's fallback (no upstream status in the
+	// event), so the retryability/class are what this pins. The exact status
+	// code is errclass.UpstreamFallback's business (it now carries an explicit
+	// 502 instead of a 0 that the host would read as a generic 500).
+	if eErr == nil || eErr.Class != errclass.ClassUpstream || !eErr.Retryable || eErr.StatusCode != 502 {
 		t.Fatalf("want retryable upstream failure, got %+v", eErr)
 	}
 }

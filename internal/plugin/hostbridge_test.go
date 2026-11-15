@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // TestBridgeCallTimeout pins the F-watchdog contract: a black-holed host
@@ -33,7 +33,7 @@ func TestBridgeCallTimeout(t *testing.T) {
 		!strings.Contains(err.Error(), "host call host.http.do timed out") {
 		t.Fatalf("Do err = %v", err)
 	}
-	if _, _, _, err := b.DoStream(ctx, pluginapi.HTTPRequest{}); err == nil ||
+	if _, _, _, err := b.DoStream(ctx, pluginapi.HTTPRequest{}, ""); err == nil ||
 		!strings.Contains(err.Error(), "host call host.http.do_stream timed out") {
 		t.Fatalf("DoStream err = %v", err)
 	}
@@ -68,7 +68,7 @@ func TestBridgeWaitForInFlight(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	if _, _, _, err := b.DoStream(ctx, pluginapi.HTTPRequest{}); err == nil ||
+	if _, _, _, err := b.DoStream(ctx, pluginapi.HTTPRequest{}, ""); err == nil ||
 		!strings.Contains(err.Error(), "host call host.http.do_stream timed out") {
 		t.Fatalf("err = %v, want timeout", err)
 	}

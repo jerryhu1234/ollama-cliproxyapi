@@ -787,3 +787,110 @@ func TestStreamResponsesTextAggregationMatchesNonStream(t *testing.T) {
 		t.Errorf("aggregated message item wrong: %v", msgItem)
 	}
 }
+
+// TestObserveFrameResolvesPayloadType pins the frame-state contract: the
+// framer returns etype="" for data-only frames (the resolution into a local
+// variable must feed BOTH conversion and observation). Before the fix a
+// fully valid data-only stream converted fine but never marked
+// Started/FinishSeen/TerminalSeen — freezing StreamSnapshot.Progress at 0
+// (so the pump's first-data timer killed the healthy stream) and making
+// FinalizeStream contradict Feed's done=true.
+func TestObserveFrameResolvesPayloadType(t *testing.T) {
+	sc := NewStreamConverter("openai-response")
+	_, done, eErr := feed(t, sc,
+		`data: {"type":"message_start","message":{"id":"m1","model":"glm-5.3","usage":{"input_tokens":2,"output_tokens":1}}}`+"\n\n")
+	if eErr != nil || done {
+		t.Fatalf("message_start: done=%v err=%v", done, eErr)
+	}
+	if !sc.StreamSnapshot().Started {
+		t.Fatal("payload-typed message_start was not observed into the frame state")
+	}
+	_, done, eErr = feed(t, sc,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":3}}`+"\n\n")
+	if eErr != nil || done {
+		t.Fatalf("message_delta: done=%v err=%v", done, eErr)
+	}
+	if !sc.StreamSnapshot().FinishSeen {
+		t.Fatal("payload-typed message_delta was not observed into the frame state")
+	}
+	events, done, eErr := feed(t, sc, `data: {"type":"message_stop"}`+"\n\n")
+	if eErr != nil {
+		t.Fatalf("message_stop errored: %v", eErr)
+	}
+	if !done {
+		t.Fatal("message_stop did not end the stream")
+	}
+	if !sc.StreamSnapshot().TerminalSeen {
+		t.Fatal("payload-typed message_stop left TerminalSeen unset — the stream is done but not terminal")
+	}
+	if fin, finErr := sc.FinalizeStream(); finErr != nil || len(fin) > 0 {
+		t.Fatalf("done=true contradicts FinalizeStream (err=%v events=%d)", finErr, len(fin))
+	}
+	if len(events) == 0 || !strings.Contains(string(events[len(events)-1]), "response.completed") {
+		t.Fatalf("message_stop on the responses target did not emit the terminal frame: %v", events)
+	}
+}
+
+// TestFlushAfterMessageStopDoesNotReemitTerminal pins Flush's one-shot
+// contract against a normally-terminated stream: the terminal
+// response.completed already went out with message_stop; a late Flush call
+// must not emit a second one (FinalizeStream guards on TerminalSeen; Flush
+// must too).
+func TestFlushAfterMessageStopDoesNotReemitTerminal(t *testing.T) {
+	sc := NewStreamConverter("openai-response")
+	_, done, eErr := feed(t, sc,
+		`data: {"type":"message_start","message":{"id":"m1","model":"glm-5.3","usage":{"input_tokens":1}}}`+"\n\n",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`+"\n\n",
+		`data: {"type":"message_stop"}`+"\n\n")
+	if eErr != nil || !done {
+		t.Fatalf("normal stream: done=%v err=%v", done, eErr)
+	}
+	if extra := sc.Flush(); len(extra) != 0 {
+		t.Fatalf("flush after message_stop re-emitted %d terminal frames: %v", len(extra), extra)
+	}
+}
+
+// TestOpenAITargetFinishChunkFollowsStopReason pins the finish-chunk shape on
+// the chat-completions target: message_delta carries usage updates too, and a
+// usage-only delta must NOT close the stream with a premature finish_reason —
+// the finish chunk waits for an actual stop_reason, and message_stop alone
+// still terminates the stream (mirroring observeFrame's non-empty guard).
+func TestOpenAITargetFinishChunkFollowsStopReason(t *testing.T) {
+	sc := NewStreamConverter("openai")
+	all, _, eErr := feed(t, sc,
+		`data: {"type":"message_start","message":{"id":"m1","model":"glm-5.3","usage":{"input_tokens":5}}}`+"\n\n")
+	if eErr != nil {
+		t.Fatalf("message_start errored: %v", eErr)
+	}
+	events, done, eErr := feed(t, sc,
+		`data: {"type":"message_delta","delta":{},"usage":{"input_tokens":6,"output_tokens":2}}`+"\n\n")
+	if eErr != nil || done {
+		t.Fatalf("usage-only message_delta: done=%v err=%v", done, eErr)
+	}
+	all = append(all, events...)
+	for _, e := range all {
+		if strings.Contains(string(e), `"finish_reason":"`) {
+			t.Fatalf("usage-only message_delta produced a premature finish chunk: %s", e)
+		}
+	}
+	deltaEvents, _, eErr := feed(t, sc,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":7,"output_tokens":3}}`+"\n\n")
+	if eErr != nil {
+		t.Fatalf("stop-bearing message_delta errored: %v", eErr)
+	}
+	all = append(all, deltaEvents...)
+	last, doneStop, _ := feed(t, sc, `data: {"type":"message_stop"}`+"\n\n")
+	all = append(all, last...)
+	if !doneStop {
+		t.Fatal("message_stop on the openai target should end the stream")
+	}
+	finishSeen := false
+	for _, e := range all {
+		if strings.Contains(string(e), `"finish_reason":"`) {
+			finishSeen = true
+		}
+	}
+	if !finishSeen {
+		t.Fatal("no finish_reason chunk ever emitted for the stop_reason-bearing stream")
+	}
+}

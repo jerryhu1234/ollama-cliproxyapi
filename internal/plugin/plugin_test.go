@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/buildinfo"
 	"ollama-cliproxyapi/internal/catalog"
@@ -429,8 +429,8 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	}
 	var reg registrationResult
 	decodeResult(t, resp, &reg)
-	if reg.SchemaVersion != pluginabi.SchemaVersion {
-		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	if reg.SchemaVersion != registeredSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, registeredSchemaVersion)
 	}
 	if reg.Metadata.Name != "ollama-cliproxyapi" || reg.Metadata.Version != buildinfo.Version ||
 		len(reg.Metadata.ConfigFields) != 0 {
@@ -598,6 +598,77 @@ func TestLifecycleAuthListFailureDoesNotWrite(t *testing.T) {
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostHTTPDo)); got != 0 {
 		t.Fatalf("catalog calls after list failure = %d, want 0", got)
+	}
+}
+
+// TestLifecycleAuthSaveFailureIsPerKeyBestEffort pins task 7: one failing
+// host.auth.save must not fail registration — that would advertise NO models
+// and take every healthy credential down with one poisoned key. The failing
+// key is logged and skipped; the rest still materialize.
+func TestLifecycleAuthSaveFailureIsPerKeyBestEffort(t *testing.T) {
+	const badKey, goodKey = "sk-best-effort-bad", "sk-best-effort-good"
+	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostAuthSave && bytes.Contains(payload, []byte(badKey)) {
+			return hostErr("write_failed", "simulated auth store failure"), nil
+		}
+		return catalogResponder(true, testCatalogJSON)(method, payload)
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(
+		"api-keys:\n  - value: "+badKey+"\n  - value: "+goodKey+"\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("one failing key must not fail registration: %+v", env.Error)
+	}
+	var saved []string
+	for _, call := range f.callsOf(pluginabi.MethodHostAuthSave) {
+		var wire pluginapi.HostAuthSaveRequest
+		if err := json.Unmarshal(call.payload, &wire); err != nil {
+			t.Fatalf("auth payload: %v", err)
+		}
+		var record struct {
+			APIKey string `json:"api_key"`
+		}
+		_ = json.Unmarshal(wire.JSON, &record)
+		saved = append(saved, record.APIKey)
+	}
+	if len(saved) != 2 {
+		t.Fatalf("auth save attempts = %v, want both keys attempted", saved)
+	}
+	m.mu.RLock()
+	advertised := len(m.mgr.Models())
+	m.mu.RUnlock()
+	if advertised == 0 {
+		t.Fatal("registration with a partly-failing auth store must still advertise models")
+	}
+}
+
+// TestLifecycleAuthSaveTotalFailureFails pins the other half of task 7: when
+// EVERY key fails to save, the auth store itself is unusable, so registration
+// still fails rather than advertising credentials that cannot be routed.
+func TestLifecycleAuthSaveTotalFailureFails(t *testing.T) {
+	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostAuthSave {
+			return hostErr("write_failed", "simulated auth store failure"), nil
+		}
+		return catalogResponder(true, testCatalogJSON)(method, payload)
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(
+		"api-keys:\n  - value: sk-all-fail-a\n  - value: sk-all-fail-b\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	env := decodeEnv(t, resp)
+	if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" {
+		t.Fatalf("total save failure envelope = %+v", env.Error)
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPDo)); got != 0 {
+		t.Fatalf("catalog calls after total save failure = %d, want 0", got)
 	}
 }
 
@@ -905,7 +976,7 @@ func TestRegisterSurvivesNilHostBridge(t *testing.T) {
 		t.Fatalf("registration must survive unavailable host client: %s", resp)
 	}
 	var reg registrationResult
-	if err := json.Unmarshal(env.Result, &reg); err != nil || reg.SchemaVersion != pluginabi.SchemaVersion {
+	if err := json.Unmarshal(env.Result, &reg); err != nil || reg.SchemaVersion != registeredSchemaVersion {
 		t.Fatalf("degraded registration malformed: %s", resp)
 	}
 }

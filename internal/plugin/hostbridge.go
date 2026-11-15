@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // RawCaller performs one host callback round-trip: method name plus JSON
@@ -44,8 +44,12 @@ func NewHostBridge(call RawCaller) *HostBridge {
 }
 
 // hostHTTPReq is the wire shape accepted by host.http.do / do_stream.
+// OperationID names an operation opened by OpenOperation: the host applies
+// that operation's context (and its registered cleanup) to the HTTP call, so
+// cancelling the operation aborts an in-flight request or stream.
 type hostHTTPReq struct {
 	HostCallbackID string      `json:"host_callback_id,omitempty"`
+	OperationID    string      `json:"operation_id,omitempty"`
 	Method         string      `json:"method"`
 	URL            string      `json:"url"`
 	Headers        http.Header `json:"headers"`
@@ -252,7 +256,14 @@ func (b *HostBridge) callWithTimeoutResult(ctx context.Context, method string, p
 				// Held until the host returns, however late: a parked
 				// goroutine is acceptable, a leaked upstream stream is not.
 				res := <-done
-				abandon(res.raw)
+				func() {
+					// This bare goroutine is a host-process hazard twice
+					// over: a panic escaping it aborts CPA, and skipping
+					// settle would leak the inFlight count so shutdown
+					// waits out its whole drain window.
+					defer func() { _ = recover() }()
+					abandon(res.raw)
+				}()
 				// Settled only after abandon fully completes, so shutdown
 				// never outruns the late-ID stream_close.
 				settle()
@@ -332,16 +343,26 @@ func (b *HostBridge) Do(ctx context.Context, req pluginapi.HTTPRequest) (plugina
 
 // DoStream opens an upstream HTTP stream via "host.http.do_stream" and
 // returns the upstream status, headers, and UPSTREAM stream ID used with
-// StreamRead/StreamClose. When the start callback outlives the attempt
-// deadline, the host may still have registered the upstream stream before
-// surfacing its status: DoStream waits streamTimeoutGrace for the orphaned
-// callback and closes any stream it produced (F1), while still returning
-// the timeout error for CPA retry handling; a result arriving after the
-// grace window is closed by the background abandon goroutine instead, so
-// no registered upstream stream ever leaks regardless of host latency.
-func (b *HostBridge) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (statusCode int, headers http.Header, upstreamStreamID string, err error) {
+// StreamRead/StreamClose. operationID, when non-empty, names an operation
+// opened by OpenOperation: the host applies that operation's context to the
+// call, so cancelling it aborts the upstream request without waiting for the
+// pump to drain. host_callback_id must ride the SAME envelope as
+// operation_id whenever the bridge is callback-scoped: the host claims the
+// operation with (operation_id, host_callback_id) and rejects the pair when
+// the callback IDs differ from the one the operation was opened under.
+//
+// When the start callback outlives the attempt deadline, the host may still
+// have registered the upstream stream before surfacing its status: DoStream
+// waits streamTimeoutGrace for the orphaned callback and closes any stream it
+// produced (F1), while still returning the timeout error for CPA retry
+// handling; a result arriving after the grace window is closed by the
+// background abandon goroutine instead, so no registered upstream stream
+// ever leaks regardless of host latency.
+func (b *HostBridge) DoStream(ctx context.Context, req pluginapi.HTTPRequest, operationID string) (statusCode int, headers http.Header, upstreamStreamID string, err error) {
 	payloadBytes, _ := json.Marshal(hostHTTPReq{
-		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body,
+		HostCallbackID: b.hostCallbackID,
+		OperationID:    operationID,
+		Method:         req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body,
 	})
 	raw, late, err := b.callWithTimeoutResult(ctx, pluginabi.MethodHostHTTPDoStream, payloadBytes, streamTimeoutGrace, b.closeLateStream)
 	if late {
@@ -387,6 +408,56 @@ func (b *HostBridge) closeLateStream(raw []byte) {
 		return
 	}
 	_ = b.StreamClose(out.StreamID)
+}
+
+// hostOperationOpenResp decodes the host.http.operation_open result.
+type hostOperationOpenResp struct {
+	OperationID string `json:"operation_id"`
+}
+
+// OpenOperation opens a host HTTP operation ("host.http.operation_open") and
+// returns its ID. The host owns the operation's context: a do/do_stream
+// envelope carrying that ID runs under it, so CancelOperation tears an
+// in-flight upstream request down immediately instead of letting the pump
+// drain it until the idle (3m) or total (30m) watchdog fires — which is what
+// a client abort needs.
+//
+// An error means "no cancellation available" and must NOT fail the request:
+// hosts older than the v8 operation bridge answer the method with an
+// unsupported-callback error, and the caller degrades to watchdog-bounded
+// teardown. A host that answered without an ID is treated the same way.
+func (b *HostBridge) OpenOperation(ctx context.Context) (string, error) {
+	env, err := b.invoke(ctx, pluginabi.MethodHostHTTPOperationOpen, struct {
+		HostCallbackID string `json:"host_callback_id,omitempty"`
+	}{HostCallbackID: b.hostCallbackID}, "host http operation open")
+	if err != nil {
+		return "", err
+	}
+	var out hostOperationOpenResp
+	if len(env.Result) > 0 && json.Unmarshal(env.Result, &out) != nil {
+		return "", fmt.Errorf("host http operation open failed: undecodable response body")
+	}
+	return strings.TrimSpace(out.OperationID), nil
+}
+
+// CancelOperation releases an operation opened by OpenOperation: the host
+// cancels the operation context (aborting the request/stream that named it)
+// and runs its registered cleanup, which closes the upstream stream. Bounded
+// by emitTimeout like the other stream callbacks — the pump calls this from a
+// deferred exit and must never wedge there. Idempotent host-side: cancelling
+// an operation whose stream already closed finds no entry and is a no-op.
+func (b *HostBridge) CancelOperation(operationID string) error {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), emitTimeout)
+	defer cancel()
+	_, err := b.invoke(ctx, pluginabi.MethodHostHTTPCancel, struct {
+		HostCallbackID string `json:"host_callback_id,omitempty"`
+		OperationID    string `json:"operation_id"`
+	}{HostCallbackID: b.hostCallbackID, OperationID: operationID}, "host http cancel")
+	return err
 }
 
 // StreamRead reads one chunk from an UPSTREAM stream opened by DoStream.
@@ -436,10 +507,20 @@ func (b *HostBridge) StreamEmit(downstreamStreamID string, payload []byte) error
 // redacted error label. Bounded by emitTimeout like StreamEmit: on a wedged
 // downstream consumer the close itself is what must not block.
 func (b *HostBridge) StreamCloseDownstream(downstreamStreamID string, errMsg string) error {
+	return b.StreamCloseDownstreamDetail(downstreamStreamID, errMsg, nil)
+}
+
+// StreamCloseDownstreamDetail is StreamCloseDownstream with an optional
+// structured error_detail (pluginabi.Error): the host's stream bridge gives it
+// precedence over the plain error string, so a classified failure keeps its
+// HTTP status and retry guidance for the client instead of degrading to the
+// host's status-less default for message-only closes.
+func (b *HostBridge) StreamCloseDownstreamDetail(downstreamStreamID, errMsg string, detail *pluginabi.Error) error {
 	req := struct {
-		StreamID string `json:"stream_id"`
-		Error    string `json:"error,omitempty"`
-	}{downstreamStreamID, errMsg}
+		StreamID    string           `json:"stream_id"`
+		Error       string           `json:"error,omitempty"`
+		ErrorDetail *pluginabi.Error `json:"error_detail,omitempty"`
+	}{downstreamStreamID, errMsg, detail}
 	ctx, cancel := context.WithTimeout(context.Background(), emitTimeout)
 	defer cancel()
 	_, err := b.invoke(ctx, pluginabi.MethodHostStreamClose, req, "host stream close")

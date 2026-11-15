@@ -232,8 +232,14 @@ func (sc *StreamConverter) passthroughLine(line string) ([][]byte, *errclass.Err
 	if data == "" {
 		return nil, nil
 	}
+	// One materialization of the payload serves the decode, the reasoning
+	// mirror, and the forwarded frame: []byte(data) is the single unavoidable
+	// string→slice copy on this path, and no consumer mutates an event buffer
+	// (the host serializes it immediately), so no defensive copy is made.
+	raw := []byte(data)
 	var observed ccChunk
-	if json.Unmarshal([]byte(data), &observed) == nil {
+	decoded := json.Unmarshal(raw, &observed) == nil
+	if decoded {
 		if !sc.streamState.Snapshot.Started && len(observed.Choices) > 0 {
 			sc.streamState.Start()
 		}
@@ -267,10 +273,46 @@ func (sc *StreamConverter) passthroughLine(line string) ([][]byte, *errclass.Err
 			}
 		}
 	}
-	if fixed := shared.BackfillReasoningContent([]byte(data), "delta"); fixed != nil {
+	if decoded {
+		// Gate the mirror on the decode already paid for:
+		// BackfillReasoningContent re-validates the WHOLE payload with gjson
+		// before doing anything, which is the most expensive step on the
+		// default route (every Ollama request lands here). Only a chunk the
+		// kernel would actually rewrite is worth that second pass.
+		if needsReasoningBackfill(observed.Choices) {
+			if fixed := shared.BackfillReasoningContent(raw, "delta"); fixed != nil {
+				return [][]byte{fixed}, nil
+			}
+		}
+		return [][]byte{raw}, nil
+	}
+	// The typed decode rejected the payload (shape drift: one member has an
+	// unexpected type) but it can still be valid JSON carrying vendor
+	// reasoning — keep the best-effort mirror on this cold path instead of
+	// silently dropping thinking text.
+	if fixed := shared.BackfillReasoningContent(raw, "delta"); fixed != nil {
 		return [][]byte{fixed}, nil
 	}
-	return [][]byte{[]byte(data)}, nil
+	return [][]byte{raw}, nil
+}
+
+// needsReasoningBackfill reports whether shared.BackfillReasoningContent could
+// actually rewrite this chunk. It mirrors the kernel's own skip rule exactly —
+// a choice needs the mirror when it carries vendor thinking text AND does not
+// already carry a non-empty reasoning_content — so the gjson validation pass
+// is only paid where it can change a byte. An upstream that already speaks the
+// standard spelling costs nothing.
+func needsReasoningBackfill(choices []ccChunkChoice) bool {
+	for i := range choices {
+		delta := &choices[i].Delta
+		if strings.TrimSpace(delta.ReasoningContent) != "" {
+			continue
+		}
+		if _, ok := delta.ReasoningText(); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (sc *StreamConverter) usageChanged(usage *ccUsage) bool {

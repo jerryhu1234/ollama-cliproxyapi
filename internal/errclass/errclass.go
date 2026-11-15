@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 // Class is a stable error-category identifier (FR-009) used as the
@@ -31,19 +31,63 @@ type Error struct {
 	Message    string
 	StatusCode int
 	Retryable  bool
+	// RetryAfterSeconds is the upstream's delta-seconds retry hint. v8's
+	// conductor times the credential cooldown from it and mirrors it into
+	// the client's Retry-After header; zero means "no hint".
+	RetryAfterSeconds int
+	// CredentialScoped marks a failure that applies to the whole credential
+	// across all models (an account-wide 429 or spend limit) rather than only
+	// the requested model. v8 reads it together with a 429 status.
+	CredentialScoped bool
 }
 
 func (e *Error) Error() string {
 	return string(e.Class) + ": " + e.Message
 }
 
+// IsCloudflareChallengeText reports whether an upstream error text carries
+// Cloudflare challenge vocabulary: "just a moment" (the canonical challenge
+// page title), "challenge-platform", "cf-mitigated", "attention required", or
+// the "cloudflare challenge" phrase this plugin prefixes onto the snippet.
+// Cloudflare fronts ollama.com, so a bot/WAF interstitial arrives as an
+// otherwise ordinary HTTP 403.
+func IsCloudflareChallengeText(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "cf-mitigated") ||
+		strings.Contains(lower, "just a moment") ||
+		strings.Contains(lower, "attention required") ||
+		strings.Contains(lower, "cloudflare challenge")
+}
+
+// fromCloudflareChallenge reclassifies a 403 whose *whole* error text carries
+// challenge vocabulary. The host routes challenge results into a short
+// backoff instead of burning the credential, but it only recognizes its own
+// vocabulary — and a real challenge page puts its markers ("Just a
+// moment...", "challenge-platform") deep in the HTML, past the 80-character
+// snippet callers keep. So classification inspects the full text it was
+// handed and prefixes the host phrase onto the bounded snippet (never
+// widening it, FR-011).
+func fromCloudflareChallenge(status int, msg string) *Error {
+	e := &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true}
+	if !strings.Contains(strings.ToLower(msg), "cloudflare challenge") {
+		e.Message = "cloudflare challenge: " + msg
+	}
+	return e
+}
+
 // FromStatus classifies an upstream HTTP status per resolved §7.
-// Network/timeout failures (no status) use FromNetwork instead. A redacted
-// message containing "quota" (case-insensitive) upgrades 429/402/403 to
-// ClassQuota — a bounded heuristic given no documented upstream quota
-// taxonomy.
+// Network/timeout failures (no status) use FromNetwork instead. A 403 whose
+// full message carries Cloudflare challenge vocabulary is a WAF interstitial,
+// not a credential problem: it becomes ClassUpstream + retryable and is
+// prefixed with the host's "cloudflare challenge" phrase. A redacted message
+// containing "quota" (case-insensitive) upgrades 429/402/403 to ClassQuota —
+// a bounded heuristic given no documented upstream quota taxonomy.
 func FromStatus(status int, message string) *Error {
 	msg := Redact(message)
+	if status == 403 && IsCloudflareChallengeText(msg) {
+		return fromCloudflareChallenge(status, msg)
+	}
 	lowerMsg := strings.ToLower(msg)
 	quota := strings.Contains(lowerMsg, "quota")
 	quotaClass := func(base Class) Class {
@@ -78,7 +122,11 @@ func FromNetwork(err error) *Error {
 	if err != nil {
 		msg = Redact(err.Error())
 	}
-	return &Error{Class: ClassNetwork, Message: msg, Retryable: true}
+	// 502: the host maps HTTPStatus 0 to a generic 500 before its
+	// default recoverable-failure branch; an explicit gateway status keeps
+	// the transport failure distinguishable in client responses while
+	// hitting the same credential-failure treatment.
+	return &Error{Class: ClassNetwork, Message: msg, StatusCode: 502, Retryable: true}
 }
 
 // PostFirstByteNetwork classifies a network/timeout failure seen AFTER the
@@ -91,7 +139,11 @@ func PostFirstByteNetwork(msg string) *Error {
 
 // Translation reports an FR-005/FR-006 translation failure; never retryable.
 func Translation(msg string) *Error {
-	return &Error{Class: ClassTranslation, Message: Redact(msg)}
+	// 400: a translation failure is a property of the client request body.
+	// Keeping the status explicit stops the host from reading the missing
+	// status as a 500 and penalizing the selected credential (v8's
+	// clienterror.IsRequestFault exempts 4xx from cooldown/rotation).
+	return &Error{Class: ClassTranslation, Message: Redact(msg), StatusCode: 400}
 }
 
 // UpstreamFallback builds a ClassUpstream error for the adapter fallback
@@ -99,19 +151,29 @@ func Translation(msg string) *Error {
 // §7 makes upstream server failures retryable; the message is redacted at
 // construction.
 func UpstreamFallback(msg string) *Error {
-	return &Error{Class: ClassUpstream, Message: Redact(msg), Retryable: true}
+	// 502: an explicit gateway-failure status keeps the host from reading
+	// the missing status as a generic 500; both map to the host's default
+	// recoverable-failure branch, but 502 is honest in client responses.
+	return &Error{Class: ClassUpstream, Message: Redact(msg), StatusCode: 502, Retryable: true}
 }
 
 // ToEnvelopeError converts to the shared SDK wire type with a redacted
 // message. Re-redacting at the envelope edge is INTENTIONAL defense-in-depth:
 // constructors already redact (so non-envelope consumers — logs, executor
 // fail paths reading .Message directly) are safe, and Redact is idempotent.
+//
+// Retryable rides along only because pre-v8 hosts read it; v8's routing and
+// cooldown pipeline is driven by Code (the class, or a recognized
+// pluginabi.ErrorCode* value), HTTPStatus, RetryAfterSeconds, and
+// CredentialScoped instead.
 func ToEnvelopeError(e *Error) pluginabi.Error {
 	return pluginabi.Error{
-		Code:       string(e.Class),
-		Message:    Redact(e.Message),
-		Retryable:  e.Retryable,
-		HTTPStatus: e.StatusCode,
+		Code:              string(e.Class),
+		Message:           Redact(e.Message),
+		Retryable:         e.Retryable,
+		HTTPStatus:        e.StatusCode,
+		RetryAfterSeconds: e.RetryAfterSeconds,
+		CredentialScoped:  e.CredentialScoped,
 	}
 }
 

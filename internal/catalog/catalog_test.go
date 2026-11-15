@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/config"
 )
@@ -1199,5 +1201,129 @@ func TestRefreshDataKeyAbsentVsEmpty(t *testing.T) {
 	}
 	if got := m.Warnings(); len(got) != 0 {
 		t.Fatalf("intended clear must stay silent, got %v", got)
+	}
+}
+
+// TestRefreshConditionalGET pins the conditional-GET contract: the validators
+// of the last successful response are replayed, and an unchanged catalog
+// therefore costs a 304 instead of the whole body. It also pins that a 200
+// carrying new validators replaces them (and a 200 carrying none clears them,
+// so the next refresh asks unconditionally instead of depending on an entity
+// tag the upstream stopped honoring).
+func TestRefreshConditionalGET(t *testing.T) {
+	fc := &fakeClient{resp: pluginapi.HTTPResponse{
+		StatusCode: 200,
+		Headers: http.Header{
+			"Etag":          []string{`W/"catalog-7"`},
+			"Last-Modified": []string{"Sun, 15 Nov 2026 10:00:00 GMT"},
+		},
+		Body: []byte(`{"data":[{"id":"glm-5.2"}]}`),
+	}}
+	m := newManager(testCfg(), fc)
+	mustRefresh(t, m)
+	if got := fc.gotReq.Headers.Get("If-None-Match"); got != "" {
+		t.Fatalf("first refresh must be unconditional, got If-None-Match=%q", got)
+	}
+	if got := fc.gotReq.Headers.Get("If-Modified-Since"); got != "" {
+		t.Fatalf("first refresh must be unconditional, got If-Modified-Since=%q", got)
+	}
+
+	mustRefresh(t, m)
+	if got := fc.gotReq.Headers.Get("If-None-Match"); got != `W/"catalog-7"` {
+		t.Errorf("If-None-Match = %q, want the retained ETag", got)
+	}
+	if got := fc.gotReq.Headers.Get("If-Modified-Since"); got != "Sun, 15 Nov 2026 10:00:00 GMT" {
+		t.Errorf("If-Modified-Since = %q, want the retained Last-Modified", got)
+	}
+
+	// A 200 without validators clears them.
+	fc.set(pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[{"id":"glm-5.3"}]}`)}, nil)
+	mustRefresh(t, m)
+	mustRefresh(t, m)
+	if got := fc.gotReq.Headers.Get("If-None-Match"); got != "" {
+		t.Errorf("validators must clear when a 200 drops them, got If-None-Match=%q", got)
+	}
+	if len(m.Models()) != 1 || m.Models()[0].UpstreamID != "glm-5.3" {
+		t.Errorf("catalog after validatorless 200 = %+v", m.Models())
+	}
+}
+
+// TestRefreshNotModifiedKeepsSnapshot pins 304 semantics: "your snapshot is
+// current" must refresh NOTHING — not the records, not the diagnostics — and
+// must never travel the fail() path. Under stale-while-unavailable:false that
+// path would wipe the very snapshot the 304 just validated.
+func TestRefreshNotModifiedKeepsSnapshot(t *testing.T) {
+	for _, stale := range []bool{true, false} {
+		name := "stale-while-unavailable=false"
+		if stale {
+			name = "stale-while-unavailable=true"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := testCfg()
+			cfg.Catalog.StaleWhileUnavailable = stale
+			fc := &fakeClient{resp: pluginapi.HTTPResponse{
+				StatusCode: 200,
+				Headers:    http.Header{"Etag": []string{`"v1"`}},
+				Body:       []byte(`{"data":[{"id":"glm-5.2"}]}`),
+			}}
+			m := newManager(cfg, fc)
+			mustRefresh(t, m)
+			before := m.Models()
+			warnsBefore := m.Warnings()
+
+			fc.set(pluginapi.HTTPResponse{StatusCode: 304}, nil)
+			mustRefresh(t, m)
+
+			if got := fc.gotReq.Headers.Get("If-None-Match"); got != `"v1"` {
+				t.Errorf("304 refresh replayed If-None-Match = %q", got)
+			}
+			after := m.Models()
+			if len(after) != 1 || after[0].UpstreamID != "glm-5.2" {
+				t.Fatalf("304 changed the snapshot: %+v", after)
+			}
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("304 changed records:\n before=%+v\n after=%+v", before, after)
+			}
+			if !reflect.DeepEqual(warnsBefore, m.Warnings()) {
+				t.Fatalf("304 changed diagnostics: %v -> %v", warnsBefore, m.Warnings())
+			}
+			// The retained validator still applies to the next attempt.
+			fc.set(pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[{"id":"glm-5.3"}]}`)}, nil)
+			mustRefresh(t, m)
+			if got := m.Models(); len(got) != 1 || got[0].UpstreamID != "glm-5.3" {
+				t.Fatalf("refresh after 304 = %+v", got)
+			}
+		})
+	}
+}
+
+// TestReadPathsShareTheSnapshotLock pins the RWMutex conversion directly: the
+// accessors called on every client request must take a READ lock. Holding one
+// RLock and running them concurrently succeeds only if they do not demand the
+// write lock (the previous sync.Mutex would deadlock here, which is exactly the
+// behavior regression this test is designed to catch).
+func TestReadPathsShareTheSnapshotLock(t *testing.T) {
+	fc := &fakeClient{resp: pluginapi.HTTPResponse{
+		StatusCode: 200, Body: []byte(`{"data":[{"id":"glm-5.2"}]}`),
+	}}
+	m := newManager(testCfg(), fc)
+	mustRefresh(t, m)
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, ok := m.Lookup("commandcode/glm-5.2"); !ok {
+			t.Error("Lookup missed the seeded record")
+		}
+		_ = m.Models()
+		_ = m.Unsupported()
+		_ = m.Warnings()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("read accessors blocked on a held read lock — they must not take the write lock")
 	}
 }

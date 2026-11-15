@@ -12,13 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/adapter/chatcompletions"
 	"ollama-cliproxyapi/internal/adapter/messages"
@@ -37,6 +36,12 @@ import (
 type executorRequest struct {
 	pluginapi.ExecutorRequest
 	StreamID string `json:"stream_id,omitempty"`
+	// HostCallbackID is the callback context the host opened for THIS request
+	// (rpcExecutorRequest.host_callback_id). It is the only handle that ties a
+	// host HTTP operation to the client request: the cgo host-callback context
+	// itself carries no request scope, so an operation opened without this id
+	// is parented to context.Background() and a client abort never reaches it.
+	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
 // resolvedExecution carries everything both execution paths need after
@@ -89,9 +94,6 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 		return ErrEnvelope("invalid_request", "malformed executor request body"), nil
 	}
 	debugTrace("executor invoked stream=%t stream_id_present=%t model_len=%d source_format_present=%t original_request_bytes=%d payload_bytes=%d", req.Stream, req.StreamID != "", len(req.Model), req.SourceFormat != "", len(req.OriginalRequest), len(req.Payload))
-	if m != nil && m.bridge != nil {
-		m.bridge.Log("info", fmt.Sprintf("ollama executor dispatch rpc=%s rpc_stream=%t stream_body=%s source_format=%s model_present=%t original_request_bytes=%d", "executor.execute", req.Stream, streamBodyField(req.OriginalRequest), req.SourceFormat, req.Model != "", len(req.OriginalRequest)), nil)
-	}
 	if req.Stream {
 		return m.executeStream(req)
 	}
@@ -112,7 +114,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(res.route, res.key),
+		Headers: upstreamAuthHeaders(res.route, res.key, false),
 		Body:    upstreamBody,
 	})
 	if err != nil {
@@ -121,7 +123,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	}
 	debugTrace("executor received non-stream status=%d body_len=%d", resp.StatusCode, len(resp.Body))
 	if resp.StatusCode >= 400 {
-		return classEnvelope(shared.UpstreamStatusError(resp.StatusCode, resp.Body)), nil
+		return classEnvelope(shared.UpstreamStatusErrorWithHeaders(resp.StatusCode, resp.Body, resp.Headers)), nil
 	}
 	// Parse/envelope guard only; true OOM prevention belongs to the host transport's byte cap.
 	if int64(len(resp.Body)) > res.cfg.MaxResponseBytes {
@@ -183,13 +185,28 @@ func buildUpstreamRequest(route catalog.Route, upstreamModel, sourceFormat strin
 	return nil, errclass.Translation("unsupported route")
 }
 
-func upstreamAuthHeaders(route catalog.Route, key string) http.Header {
+// upstreamAuthHeaders builds the FR-007 upstream headers. Stream requests also
+// mirror the native OpenAI-compat executor's Accept/Cache-Control pair: OpenAI
+// style gateways and CDNs key response buffering off Accept, so a stream
+// request without "Accept: text/event-stream" risks server-side buffering
+// that presents as slow time-to-first-byte. Content-Type is always set: the
+// upstream body is JSON on every route, and a POST body without it is
+// malformed per RFC 9110.
+func upstreamAuthHeaders(route catalog.Route, key string, stream bool) http.Header {
+	var h http.Header
 	if route == catalog.RouteMessages {
 		// Ollama's Anthropic-compatible endpoint accepts Bearer only.
-		return messages.AuthHeaders(key)
+		h = messages.AuthHeaders(key)
+	} else {
+		// Chat Completions and Responses endpoints are OpenAI-style bearer.
+		h = chatcompletions.AuthHeaders(key)
 	}
-	// Chat Completions and Responses endpoints are OpenAI-style bearer.
-	return chatcompletions.AuthHeaders(key)
+	h.Set("Content-Type", "application/json")
+	if stream {
+		h.Set("Accept", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+	}
+	return h
 }
 
 // convertNonStream routes one upstream response to its adapter's uniform
@@ -209,7 +226,8 @@ func convertNonStream(route catalog.Route, sourceFormat string, status int, body
 }
 
 // classEnvelope renders a classified failure as the wire error envelope;
-// ToEnvelopeError redacts and propagates Retryable/HTTPStatus host-side.
+// ToEnvelopeError redacts and propagates HTTPStatus/RetryAfterSeconds/
+// CredentialScoped host-side.
 func classEnvelope(e *errclass.Error) []byte {
 	wire := errclass.ToEnvelopeError(e)
 	out, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &wire})
@@ -274,42 +292,7 @@ func (m *Manager) handleExecuteStream(request []byte) ([]byte, error) {
 		return ErrEnvelope("invalid_request", "malformed executor request body"), nil
 	}
 	debugTrace("executor stream invoked stream=%t stream_id_present=%t model_len=%d source_format_present=%t original_request_bytes=%d payload_bytes=%d", req.Stream, req.StreamID != "", len(req.Model), req.SourceFormat != "", len(req.OriginalRequest), len(req.Payload))
-	if m != nil && m.bridge != nil {
-		m.bridge.Log("info", fmt.Sprintf("ollama executor dispatch rpc=%s rpc_stream=%t stream_body=%s source_format=%s model_present=%t original_request_bytes=%d", "executor.execute_stream", req.Stream, streamBodyField(req.OriginalRequest), req.SourceFormat, req.Model != "", len(req.OriginalRequest)), nil)
-	}
 	return m.executeStream(req)
-}
-
-// streamBodyField mirrors the host's dispatch probe (gjson "stream") on the
-// raw client body the plugin received verbatim: it reports the JSON type of
-// the stream member so a manager showing "streaming: no" can be traced to the
-// exact request shape without enabling CPA request-log. Recorded values:
-// "true", "false", "absent", or a non-boolean JSON type name
-// (string/number/object/array/null). Debug-only; only the type is logged,
-// never the payload.
-func streamBodyField(originalRequest []byte) string {
-	var probe struct {
-		Stream any `json:"stream"`
-	}
-	if len(originalRequest) == 0 {
-		return "absent"
-	}
-	if err := json.Unmarshal(originalRequest, &probe); err != nil {
-		return "malformed"
-	}
-	if probe.Stream == nil {
-		return "absent"
-	}
-	switch v := probe.Stream.(type) {
-	case bool:
-		return strconv.FormatBool(v)
-	case float64:
-		return "number"
-	case string:
-		return "string"
-	default:
-		return "object_or_array"
-	}
 }
 
 // executeStream runs the already-decoded stream execution: pre-first-byte errors
@@ -334,14 +317,46 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	limits := limitsFromConfig(res.cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), limits.first)
 	defer cancel()
-	st, _, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
+	// Host HTTP operation: the host runs do_stream under the operation's
+	// context, so cancelling it tears the upstream request down the moment the
+	// pump exits for any reason — client abort included — instead of letting
+	// the pump drain until the idle (3m) / total (30m) watchdog fires.
+	//
+	// Opened only when this request carries a host callback id, and always on
+	// a bridge scoped to it: the host derives the operation's parent context
+	// from that callback context (the client request's own context), which is
+	// what lets an abort cancel the upstream while no bytes are flowing.
+	// Without an id there is no request-scoped parent to inherit, and opening
+	// the operation on the LOCAL ctx would be actively harmful — that ctx is
+	// cancelled by the defer above the instant this function returns, so it
+	// would abort the stream it just started.
+	//
+	// Never half-applied either: if the host refuses the operation, the bridge
+	// stays unscoped, so do_stream goes out exactly as it did before this
+	// batch (no operation_id, no host_callback_id) and teardown stays
+	// watchdog-bounded.
+	opBridge := m.bridge
+	operationID := ""
+	if m.bridge != nil && req.HostCallbackID != "" {
+		scoped := m.bridge.withHostCallbackID(req.HostCallbackID)
+		if id, openErr := scoped.OpenOperation(ctx); openErr == nil && id != "" {
+			opBridge, operationID = scoped, id
+		}
+	}
+	cancelOp := func() {
+		if opBridge != nil {
+			_ = opBridge.CancelOperation(operationID)
+		}
+	}
+	st, respHeaders, id, err := opBridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(res.route, res.key),
+		Headers: upstreamAuthHeaders(res.route, res.key, true),
 		Body:    upstreamBody,
-	})
-	debugTrace("executor stream DoStream status=%d upstreamID=%s err=%v", st, id, err)
+	}, operationID)
+	debugTrace("executor stream DoStream status=%d upstreamID=%s operation_present=%t err=%v", st, id, operationID != "", err)
 	if err != nil {
+		cancelOp()
 		cause := "start_error"
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out") {
 			cause = "start_timeout"
@@ -362,8 +377,9 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 			}
 			_ = m.bridge.StreamClose(id)
 		}
+		cancelOp()
 		m.logStreamFinished(res.route, req.SourceFormat, "http_status", streamStart, nil, nil, nil, int64(len(body)), 0, shared.StreamSnapshot{}, false)
-		return classEnvelope(shared.UpstreamStatusError(st, body)), nil
+		return classEnvelope(shared.UpstreamStatusErrorWithHeaders(st, body, respHeaders)), nil
 	}
 
 	downID := req.StreamID
@@ -374,20 +390,59 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		if m.bridge != nil {
 			defer m.bridge.inFlight.Done()
 		}
-		m.pumpStream(downID, id, res, req.SourceFormat, streamStart, responsesRequestContext(req))
+		// Panic containment: the pump consumes hostile upstream data inside
+		// the host process — an unrecovered panic here would abort the whole
+		// CPA host, not just this request.
+		defer m.recoverStreamPump(downID)
+		m.pumpStream(downID, id, cancelOp, res, req.SourceFormat, streamStart, responsesRequestContext(req))
 	}()
 	return okEnvelope(struct{}{}), nil
 }
 
-func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string, streamStart time.Time, originalRequest ...[]byte) {
+// recoverStreamPump absorbs a panic escaping the stream pump goroutine and
+// surfaces it through host.log. pumpStream's own deferred close (and the
+// operation cancel) already released every stream before the panic reached
+// this guard, so nothing is re-closed here.
+func (m *Manager) recoverStreamPump(downID string) {
+	if r := recover(); r == nil {
+		return
+	}
+	if m.bridge == nil {
+		return
+	}
+	_ = m.bridge.Log("error", "stream pump panicked; downstream streams closed",
+		map[string]any{"downstream_id": downID})
+}
+
+// pumpStream reads the upstream stream, converts each chunk, and emits it
+// downstream. cancelOperation, when non-nil, releases the host HTTP operation
+// the upstream stream runs under; the deferred call releases it however the
+// pump exits.
+func (m *Manager) pumpStream(downID, upstreamID string, cancelOperation func(), res *resolvedExecution, sourceFormat string, streamStart time.Time, originalRequest ...[]byte) {
 	var closeOnce sync.Once
-	closeStreams := func(downErrMsg string) {
+	// closeStreams terminates both streams. detail, when non-nil, is the
+	// structured pluginabi.Error for the downstream close: the host bridge
+	// gives it precedence over the plain message, so classified failures
+	// keep their HTTP status / retry guidance for the client.
+	closeStreams := func(downErrMsg string, detail *pluginabi.Error) {
 		closeOnce.Do(func() {
 			_ = m.bridge.StreamClose(upstreamID)
-			_ = m.bridge.StreamCloseDownstream(downID, downErrMsg)
+			_ = m.bridge.StreamCloseDownstreamDetail(downID, downErrMsg, detail)
 		})
 	}
-	defer closeStreams("")
+	// Deferred teardown on every exit path, including a panic reaching the
+	// guard above: close both streams first (closeStreams is Once-guarded, so
+	// the body's explicit closes win), then cancel the host operation. Doing
+	// the stream close before the operation cancel keeps a normal finish a
+	// normal finish — the operation cancel is the parent-context abort that
+	// remains for client-abort paths where the pump exits before the upstream
+	// would have gone idle.
+	defer func() {
+		closeStreams("", nil)
+		if cancelOperation != nil {
+			cancelOperation()
+		}
+	}()
 
 	conv := newStreamConverter(res.route, sourceFormat, originalRequest...)
 	limits := limitsFromConfig(res.cfg)
@@ -434,33 +489,34 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 				}); ok {
 					events, fErr := finalizer.FinalizeStream()
 					if fErr != nil {
-						closeStreams(errclass.Redact(fErr.Message))
+						wire := errclass.ToEnvelopeError(fErr)
+						closeStreams(wire.Message, &wire)
 						logDone("terminal_error", upstreamClosed)
 						return
 					}
 					if emitErr := m.emitAll(downID, events); emitErr != nil {
-						closeStreams(errclass.Redact(emitErr.Error()))
+						closeStreams(errclass.Redact(emitErr.Error()), nil)
 						logDone("emit_error", upstreamClosed)
 						return
 					}
 					logDone("finish_grace", upstreamClosed)
 					return
 				}
-				closeStreams("stream terminal incomplete")
+				closeStreams("stream terminal incomplete", nil)
 				logDone("terminal_error", upstreamClosed)
 				return
 			}
-			closeStreams(streamCauseError(cause))
+			closeStreams(streamCauseError(cause), streamWatchdogDetail(cause))
 			logDone(cause, upstreamClosed)
 			return
 		}
 		if err != nil {
-			closeStreams(errclass.Redact(err.Error()))
+			closeStreams(errclass.Redact(err.Error()), nil)
 			logDone("read_error", upstreamClosed)
 			return
 		}
 		if readErrMsg != "" {
-			closeStreams(errclass.Redact(readErrMsg))
+			closeStreams(errclass.Redact(readErrMsg), nil)
 			logDone("upstream_error", upstreamClosed)
 			return
 		}
@@ -469,7 +525,7 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 			chunks++
 		}
 		if total > res.cfg.MaxResponseBytes {
-			closeStreams(errclass.Redact("stream exceeded max-response-bytes"))
+			closeStreams(errclass.Redact("stream exceeded max-response-bytes"), nil)
 			logDone("max_bytes", upstreamClosed)
 			return
 		}
@@ -490,12 +546,13 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 			}
 		}
 		if convErr != nil {
-			closeStreams(errclass.Redact(convErr.Message))
+			wire := errclass.ToEnvelopeError(convErr)
+			closeStreams(wire.Message, &wire)
 			logDone("terminal_error", upstreamClosed)
 			return
 		}
 		if emitErr := m.emitAll(downID, events); emitErr != nil {
-			closeStreams(errclass.Redact(emitErr.Error()))
+			closeStreams(errclass.Redact(emitErr.Error()), nil)
 			logDone("emit_error", upstreamClosed)
 			return
 		}
@@ -511,19 +568,20 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		}); ok {
 			flushed, flushErr := flusher.FlushWithError()
 			if flushErr != nil {
-				closeStreams(errclass.Redact(flushErr.Message))
+				wire := errclass.ToEnvelopeError(flushErr)
+				closeStreams(wire.Message, &wire)
 				logDone("truncated", true)
 				return
 			}
 			if emitErr := m.emitAll(downID, flushed); emitErr != nil {
-				closeStreams(errclass.Redact(emitErr.Error()))
+				closeStreams(errclass.Redact(emitErr.Error()), nil)
 				logDone("emit_error", true)
 				return
 			}
 		} else if flusher, ok := conv.(interface{ Flush() [][]byte }); ok {
 			flushed := flusher.Flush()
 			if emitErr := m.emitAll(downID, flushed); emitErr != nil {
-				closeStreams(errclass.Redact(emitErr.Error()))
+				closeStreams(errclass.Redact(emitErr.Error()), nil)
 				logDone("emit_error", true)
 				return
 			}
@@ -550,6 +608,25 @@ func streamCauseError(cause string) string {
 		return "stream terminal incomplete"
 	}
 	return "stream truncated"
+}
+
+// streamWatchdogDetail renders a watchdog cause as the structured
+// error_detail for the downstream close. Code is pluginabi's
+// ErrorCodeStreamTruncated: the upstream generation was already accepted and
+// partially delivered, so v8 must skip credential cooldown and must not replay
+// the request on another credential, while the client still sees the timeout
+// as a 504 rather than the host's status-less default. Unknown causes return
+// nil, leaving the plain message only.
+func streamWatchdogDetail(cause string) *pluginabi.Error {
+	switch cause {
+	case "first_data", "idle", "total":
+		return &pluginabi.Error{
+			Code:       pluginabi.ErrorCodeStreamTruncated,
+			Message:    streamCauseError(cause),
+			HTTPStatus: http.StatusGatewayTimeout,
+		}
+	}
+	return nil
 }
 
 func (m *Manager) logStreamFinished(route catalog.Route, sourceFormat, cause string, start time.Time, headersAt, firstDataAt, lastProgressAt *time.Time, total, chunks int64, snapshot shared.StreamSnapshot, eof bool, streamUsage ...StreamUsageTrace) {

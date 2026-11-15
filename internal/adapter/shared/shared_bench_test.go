@@ -2,6 +2,7 @@ package shared
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +45,39 @@ func BenchmarkRewriteModelIDNoop(b *testing.B) {
 	}
 }
 
+// largeRewriteBody is a multi-MB native-format request: the shape that made
+// the old decode/remarshal path allocate a second whole-document buffer and
+// rewrite every byte (defeating upstream prompt-prefix caching).
+func largeRewriteBody() []byte {
+	var b strings.Builder
+	b.WriteString(`{"model":"client-id","stream":true,"messages":[`)
+	for i := 0; i < 12000; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"role":"user","content":"The quick brown fox jumps over the lazy dog. 0123456789"}`)
+	}
+	b.WriteString(`],"max_tokens":4096}`)
+	return []byte(b.String())
+}
+
+// BenchmarkRewriteModelIDLargeBody pins the rewrite cost on a long request:
+// the output is one spliced copy, not a remarshal of every field.
+func BenchmarkRewriteModelIDLargeBody(b *testing.B) {
+	body := largeRewriteBody()
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		out, eErr := RewriteModelID("upstream-id", body, "openai")
+		if eErr != nil {
+			b.Fatalf("rewrite failed: %v", eErr)
+		}
+		if len(out) == 0 {
+			b.Fatal("empty output")
+		}
+	}
+}
+
 // Guard so the noop benchmark cannot silently drift into a body where the
 // model field differs (which would measure the rewrite path instead).
 func TestBenchBodyIsNoop(t *testing.T) {
@@ -69,21 +103,27 @@ func TestRewriteModelIDNoopReturnsOriginalBody(t *testing.T) {
 	if &out[0] != &body[0] {
 		t.Fatal("no-op case must return the original body, not a copy")
 	}
-	// A differing model still rewrites through the full map path.
+	// A differing model rewrites in place, byte-preserving every other field.
 	out, eErr = RewriteModelID("upstream-id", body, "openai")
 	if eErr != nil || out == nil {
 		t.Fatalf("rewrite: %v", eErr)
 	}
-	var got map[string]any
-	if err := json.Unmarshal(out, &got); err != nil || got["model"] != "upstream-id" {
-		t.Fatalf("rewrite wrong: %v %s", err, out)
+	if want := `{"model":"upstream-id","messages":[{"role":"user","content":"hi"}]}`; string(out) != want {
+		t.Fatalf("rewrite must preserve every other byte:\n got %s\nwant %s", out, want)
 	}
 	// An escape-free upstream id whose inbound bytes differ only in
-	// escaping cannot exist (RawMessage stores decoded-value bytes), but
-	// a quote-bearing id never matches the fast path and keeps the
-	// documented unrepresentable-id error.
-	if _, eErr := RewriteModelID(`a"b`, []byte(`{"model":"a\"b"}`), "openai"); eErr == nil {
-		t.Fatal("quote-bearing id must keep the fall-through error")
+	// escaping cannot exist for the no-op path (the comparison is on the
+	// decoded value), and a quote-bearing id now rewrites correctly — sjson
+	// escapes it instead of failing (TestRewriteModelIDEscapedModelID).
+	out, eErr = RewriteModelID(`a"b`, []byte(`{"model":"a\"b","z":1}`), "openai")
+	if eErr != nil {
+		t.Fatalf("quote-bearing id: %v", eErr)
+	}
+	var quoted struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(out, &quoted); err != nil || quoted.Model != `a"b` {
+		t.Fatalf("quote-bearing rewrite = %q (%v)", out, err)
 	}
 }
 

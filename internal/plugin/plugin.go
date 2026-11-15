@@ -10,13 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/buildinfo"
 	"ollama-cliproxyapi/internal/catalog"
 	"ollama-cliproxyapi/internal/config"
-	"ollama-cliproxyapi/internal/errclass"
 	"ollama-cliproxyapi/internal/predictor"
 )
 
@@ -189,15 +188,11 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": ProviderID}), nil
 	case pluginabi.MethodExecutorCountTokens:
-		return classEnvelope(&errclass.Error{
-			Class:   errclass.ClassUnsupported,
-			Message: "executor.count_tokens has no Ollama equivalent",
-		}), nil
+		return notImplementedEnvelope(
+			"executor.count_tokens has no Ollama equivalent"), nil
 	case pluginabi.MethodExecutorHTTPRequest:
-		return classEnvelope(&errclass.Error{
-			Class:   errclass.ClassUnsupported,
-			Message: fmt.Sprintf("%s endpoint is not supported by ollama", pluginabi.MethodExecutorHTTPRequest),
-		}), nil
+		return notImplementedEnvelope(fmt.Sprintf(
+			"%s endpoint is not supported by ollama", pluginabi.MethodExecutorHTTPRequest)), nil
 	default:
 		return ErrEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -205,7 +200,7 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 
 // lifecycleRequest mirrors rpcLifecycleRequest: config_yaml is base64.
 // The request's schema_version is decoded-and-ignored; registration echoes
-// pluginabi.SchemaVersion.
+// registeredSchemaVersion (pinned to the contract this plugin implements).
 type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
 }
@@ -221,6 +216,15 @@ type capabilities struct {
 	QuotaProvider         bool                         `json:"quota_provider"`
 }
 
+// registeredSchemaVersion pins the registration contract to schema 6 rather
+// than following pluginabi.SchemaVersion, which jumped 6→10 in the v8 SDK.
+// The v8 host accepts any plugin schema ≤ its own and degrades gracefully, so
+// staying at 6 keeps the exact host negotiation semantics this plugin was
+// built and tested against. Every schema 7–10 gate (omit-body flags, byte-range
+// body patching, multi-provider models, multi-auth providers) is a capability
+// this plugin does not declare, so nothing below 10 is lost.
+const registeredSchemaVersion = 6
+
 type registrationResult struct {
 	SchemaVersion uint32             `json:"schema_version"`
 	Metadata      pluginapi.Metadata `json:"metadata"`
@@ -230,7 +234,7 @@ type registrationResult struct {
 func registrationEnvelope() []byte {
 	formats := []string{"openai", "claude", "openai-response"}
 	return okEnvelope(registrationResult{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: registeredSchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          buildinfo.Version,
@@ -417,6 +421,9 @@ func (m *Manager) materializeAuthRecords(ctx context.Context, cfg config.Config)
 			existing[id] = struct{}{}
 		}
 	}
+	// attempts counts keys that needed a save this round; registration fails
+	// only when every such save failed (see the loop's per-key rationale).
+	var attempts, failures int
 	for _, key := range cfg.APIKeys {
 		hash := authKeyHash(key.Value)
 		id := authRecordIDFromHash(hash)
@@ -438,14 +445,26 @@ func (m *Manager) materializeAuthRecords(ctx context.Context, cfg config.Config)
 		if err != nil {
 			return fmt.Errorf("build auth record")
 		}
+		// Per-key best-effort: one poisoned or host-failing key must not fail
+		// the whole registration — that advertises NO models at all, so every
+		// healthy credential becomes unusable too. Log and keep going;
+		// registration still fails (as before) only when EVERY key fails,
+		// which means the auth store itself is unusable.
+		attempts++
 		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{
 			Name: name, JSON: record,
 		}); err != nil {
-			return err
+			failures++
+			_ = m.bridge.Log("warn", "auth record materialization failed for key",
+				map[string]any{"target": name, "error": err.Error()})
+			continue
 		}
 		existing[id] = struct{}{}
 		existing[name] = struct{}{}
 		debugTrace("auth materialized id=%s file=%s", id, name)
+	}
+	if attempts > 0 && failures == attempts {
+		return fmt.Errorf("all %d auth record saves failed", attempts)
 	}
 	return nil
 }
@@ -563,20 +582,42 @@ func (m *Manager) closeStop() chan struct{} {
 	return done
 }
 
-// refreshOnce runs one bounded catalog refresh. Catalog refresh is not a client
-// request, so the fallback uses the first configured key only and has no client
-// selection, rotation, cooldown, or retry state. parent bounds-and-cancels
-// the attempt: the lifecycle path passes context.Background() plus
-// registerRefreshTimeout; ticker ticks pass the loop's stop-derived context
-// plus the full request-timeout, so close(stop) aborts an in-flight tick
-// (F4). On failure it logs a warn via host.log — error text is a redacted
-// category label from the catalog package, never key material (FR-011).
+// refreshOnce runs one bounded catalog refresh. Catalog refresh is not a
+// client request, so it has no client selection, rotation, cooldown, or retry
+// state — but it does fail over across EVERY configured key: one revoked or
+// regionally-invalid key must not pin the catalog (and therefore the whole
+// model list) to death while the others are healthy. First success wins; each
+// per-key failure logs its own warn (the catalog package's error text is a
+// redacted category label, never key material — FR-011). parent
+// bounds-and-cancels the attempt: the lifecycle path passes
+// context.Background() plus registerRefreshTimeout; ticker ticks pass the
+// loop's stop-derived context plus the full request-timeout, so close(stop)
+// aborts an in-flight tick (F4). On total failure it logs a warn via host.log.
 func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridge, timeout time.Duration, cfg config.Config) error {
 	// Fallback: configured materialization input is catalog-only; CPA client
 	// authentication remains owned by its AuthProvider and CPA.
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	err := mgr.Refresh(ctx, cfg.APIKeys[0].Value)
+	// Local guard: config validation already requires at least one key, but
+	// that is a cross-package invariant and indexing [0] here would panic if
+	// a future caller builds Config directly.
+	if len(cfg.APIKeys) == 0 {
+		err := fmt.Errorf("catalog refresh failed: no api keys configured")
+		if bridge != nil {
+			_ = bridge.Log("warn", "catalog refresh failed", map[string]any{"error": err.Error()})
+		}
+		return err
+	}
+	var err error
+	for _, key := range cfg.APIKeys {
+		if err = mgr.Refresh(ctx, key.Value); err == nil {
+			break
+		}
+		if bridge != nil && len(cfg.APIKeys) > 1 {
+			_ = bridge.Log("warn", "catalog refresh failed with key; trying next configured key",
+				map[string]any{"error": err.Error()})
+		}
+	}
 	if err != nil {
 		if bridge != nil {
 			_ = bridge.Log("warn", "catalog refresh failed", map[string]any{"error": err.Error()})
@@ -594,12 +635,21 @@ func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridg
 		if len(warnings) > 0 {
 			fields["warnings"] = strings.Join(warnings, "; ")
 		}
-		_ = bridge.Log("warn", "unsupported models excluded from routable catalog", fields)
+		logBridgeWarn(bridge, "unsupported models excluded from routable catalog", fields)
 	} else if len(warnings) > 0 {
-		_ = bridge.Log("warn", "catalog normalization warnings",
+		logBridgeWarn(bridge, "catalog normalization warnings",
 			map[string]any{"warnings": strings.Join(warnings, "; ")})
 	}
 	return nil
+}
+
+// logBridgeWarn emits a host.log warn, tolerating the nil bridge the
+// lifecycle deliberately supports.
+func logBridgeWarn(bridge *HostBridge, message string, fields map[string]any) {
+	if bridge == nil {
+		return
+	}
+	_ = bridge.Log("warn", message, fields)
 }
 
 func okEnvelope(result any) []byte {
@@ -610,5 +660,20 @@ func okEnvelope(result any) []byte {
 
 func ErrEnvelope(code, message string) []byte {
 	out, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{Code: code, Message: message}})
+	return out
+}
+
+// notImplementedEnvelope renders an optional-capability refusal as the host's
+// dedicated "not_implemented" code rather than errclass.ClassUnsupported.
+// Only ErrorCodeNotImplemented is in v8's cooldown-exempt whitelist: a plugin
+// that cannot count tokens would otherwise have its credential (and the model
+// behind it) marked unavailable for a capability it never claimed. The
+// message stays human-readable for the client; errclass.ToEnvelopeError is
+// deliberately bypassed because it always maps a Class onto its wire code.
+func notImplementedEnvelope(message string) []byte {
+	out, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{
+		Code:    pluginabi.ErrorCodeNotImplemented,
+		Message: message,
+	}})
 	return out
 }

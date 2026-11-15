@@ -68,7 +68,18 @@ func (c *streamController) armPhase(d time.Duration, cause string) {
 	c.phaseTimer = time.AfterFunc(d, func() { defer c.wg.Done(); c.fire(g, cause) })
 	c.mu.Unlock()
 }
+
+// fire claims the timeout cause and closes the upstream stream to release a
+// blocked StreamRead. It runs on a time.AfterFunc goroutine — a bare goroutine
+// inside the host process — so the cgo close is panic-guarded: one timer must
+// never take the whole CPA host down.
 func (c *streamController) fire(g uint64, cause string) {
+	defer func() {
+		if r := recover(); r != nil && c.bridge != nil {
+			_ = c.bridge.Log("error", "stream watchdog close panicked",
+				map[string]any{"cause": cause})
+		}
+	}()
 	c.mu.Lock()
 	if !c.active || (g != 0 && g != c.generation) || c.cause != "" {
 		c.mu.Unlock()

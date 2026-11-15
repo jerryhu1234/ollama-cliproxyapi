@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/adapter/shared"
 	"ollama-cliproxyapi/internal/catalog"
@@ -54,6 +54,10 @@ func execStreamReqBodyForKey(model, format string, body []byte, downStreamID, ke
 			Model: model, SourceFormat: format, OriginalRequest: body, Stream: true,
 		},
 		StreamID: downStreamID,
+		// The v8 host always opens a callback context per executor call and
+		// sends its id here; the stream path needs it to parent the host HTTP
+		// operation to the client request.
+		HostCallbackID: "cb-test",
 	})
 	return b
 }
@@ -1447,17 +1451,20 @@ func TestExecutorIdentifierAndCountTokens(t *testing.T) {
 		t.Fatalf("count_tokens: %v", err)
 	}
 	env = decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+	// v8 only whitelists ErrorCodeNotImplemented for cooldown exemption, so a
+	// capability refusal reported as ClassUnsupported would mark the credential
+	// (and its models) unavailable for something the plugin never claimed.
+	if env.OK || env.Error == nil || env.Error.Code != pluginabi.ErrorCodeNotImplemented {
 		t.Fatalf("count_tokens envelope = %s", resp)
 	}
 	// executor.http_request has no handler either: it must classify as
-	// unsupported (not generic unknown_method), naming the method/endpoint.
+	// not-implemented (not generic unknown_method), naming the method/endpoint.
 	resp, err = m.HandleCall(pluginabi.MethodExecutorHTTPRequest, nil)
 	if err != nil {
 		t.Fatalf("http_request: %v", err)
 	}
 	env = decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+	if env.OK || env.Error == nil || env.Error.Code != pluginabi.ErrorCodeNotImplemented {
 		t.Fatalf("http_request envelope = %s", resp)
 	}
 	if !strings.Contains(env.Error.Message, "executor.http_request") {
@@ -1552,11 +1559,26 @@ func TestConvertNonStreamSeamBranches(t *testing.T) {
 	if got := catalog.JoinUpstreamURL("https://gw.test/", "/v1/responses"); got != "https://gw.test/v1/responses" {
 		t.Fatalf("url join = %q", got)
 	}
-	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k"); got.Get("Authorization") != "Bearer k" || got.Get("x-commandcode-session") != "" {
+	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k", false); got.Get("Authorization") != "Bearer k" ||
+		got.Get("Content-Type") != "application/json" {
 		t.Fatalf("bearer headers = %v", got)
 	}
-	if got := upstreamAuthHeaders(catalog.RouteMessages, "k"); got.Get("Authorization") != "Bearer k" || got.Get("anthropic-version") != "2023-06-01" {
+	if got := upstreamAuthHeaders(catalog.RouteMessages, "k", false); got.Get("Authorization") != "Bearer k" ||
+		got.Get("anthropic-version") != "2023-06-01" || got.Get("Content-Type") != "application/json" {
 		t.Fatalf("messages headers = %v", got)
+	}
+	// Stream parity with the native OpenAI-compat executor: Accept gates
+	// upstream/CDN buffering off only for stream requests, never for a
+	// non-stream call whose response must stay a plain JSON body.
+	for _, route := range []catalog.Route{catalog.RouteChatCompletions, catalog.RouteMessages, catalog.RouteResponses} {
+		if got := upstreamAuthHeaders(route, "k", false); got.Get("Accept") != "" || got.Get("Cache-Control") != "" {
+			t.Fatalf("non-stream %s sent stream headers: %v", route, got)
+		}
+		got := upstreamAuthHeaders(route, "k", true)
+		if got.Get("Accept") != "text/event-stream" || got.Get("Cache-Control") != "no-cache" ||
+			got.Get("Content-Type") != "application/json" {
+			t.Fatalf("stream %s headers = %v", route, got)
+		}
 	}
 	// Adapters own status classification uniformly (§7).
 	if _, eErr := convertNonStream(catalog.RouteMessages, "claude", http.StatusServiceUnavailable, []byte("upstream down")); eErr == nil ||
@@ -1865,31 +1887,368 @@ func TestExecuteStreamBlockedEmitCannotWedgeTheProducer(t *testing.T) {
 	}
 }
 
-// streamBodyField mirrors the host's gjson "stream" dispatch probe and must
-// report the exact JSON type of the body's stream member: a boolean true,
-// any other present type, or absence. This is the evidence a manager uses to
-// attribute a "streaming: no" row to the request shape.
-func TestStreamBodyField(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-		want string
-	}{
-		{"boolean true", `{"stream":true}`, "true"},
-		{"boolean false", `{"stream":false}`, "false"},
-		{"absent", `{"model":"m"}`, "absent"},
-		{"string true", `{"stream":"true"}`, "string"},
-		{"number", `{"stream":1}`, "number"},
-		{"null", `{"stream":null}`, "absent"},
-		{"object", `{"stream":{}}`, "object_or_array"},
-		{"malformed body", `{bad`, "malformed"},
-		{"empty body", ``, "absent"},
+// TestStreamPumpPanicIsContainedAndLogged pins the panic guard around the
+// stream pump goroutine: the plugin runs in-process inside the host, so an
+// unrecovered panic anywhere in the pump aborts the whole CPA process instead
+// of one request. The guard logs through host.log and must not re-close the
+// streams pumpStream already released.
+func TestStreamPumpPanicIsContainedAndLogged(t *testing.T) {
+	f := &fakeCaller{responder: func(string, []byte) ([]byte, error) {
+		return hostOK(map[string]any{}), nil
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	func() {
+		defer m.recoverStreamPump("down-1")
+		panic("boom")
+	}()
+	logged := false
+	var payload []byte
+	for _, c := range f.callsOf(pluginabi.MethodHostLog) {
+		if strings.Contains(string(c.payload), "panic") {
+			logged = true
+			payload = c.payload
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := streamBodyField([]byte(tc.body)); got != tc.want {
-				t.Fatalf("streamBodyField(%q) = %q, want %q", tc.body, got, tc.want)
-			}
-		})
+	if !logged {
+		t.Fatal("stream pump panic was not logged to the host")
+	}
+	if !strings.Contains(string(payload), `"down-1"`) {
+		t.Fatalf("panic log lost the downstream id: %s", payload)
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostStreamClose)); got != 0 {
+		t.Fatalf("panic guard re-closed %d downstream streams; pumpStream's own close already ran", got)
+	}
+}
+
+// TestExecuteStreamDoesNotParseClientBodyForDispatchLog pins the removal of
+// the per-request host.log dispatch probe: it fully unmarshalled the client
+// body (and crossed cgo) on EVERY request just to name the JSON type of
+// "stream". Only the release-no-op debugTrace may inspect the request now.
+func TestExecuteStreamDoesNotParseClientBodyForDispatchLog(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{upstreamID: "up-dispatch"})
+	if resp, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("ollama/glm-5.3", "openai", []byte(ccRequestBody), "down-dispatch")); err != nil || !decodeEnv(t, resp).OK {
+		t.Fatalf("execute_stream: %s %v", resp, err)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	for _, c := range f.callsOf(pluginabi.MethodHostLog) {
+		if strings.Contains(string(c.payload), "dispatch") || strings.Contains(string(c.payload), "stream_body") {
+			t.Fatalf("per-request dispatch log still emitted: %s", c.payload)
+		}
+	}
+}
+
+// TestExecuteStreamOpensAndCancelsOperation pins the client-cancel plumbing:
+// executeStream opens a host HTTP operation before do_stream and carries its
+// id on the SAME envelope, and the pump cancels it on exit for EVERY reason —
+// otherwise an aborted downstream keeps draining the upstream until the idle
+// (3m) / total (30m) watchdog fires.
+func TestExecuteStreamOpensAndCancelsOperation(t *testing.T) {
+	const opID = "op-42"
+	base := streamResponder(streamScript{
+		upstreamID: "up-op",
+		frames:     []string{chatDelta("hi"), finishFrame(), "data: [DONE]\n\n"},
+	})
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostHTTPOperationOpen {
+			return hostOK(hostOperationOpenResp{OperationID: opID}), nil
+		}
+		return base(method, payload)
+	})
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	resp, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("ollama/glm-5.3", "openai", []byte(ccRequestBody), "down-op"))
+	if err != nil || !decodeEnv(t, resp).OK {
+		t.Fatalf("execute_stream: %s %v", resp, err)
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPOperationOpen)); got != 1 {
+		t.Fatalf("operation_open calls = %d, want 1", got)
+	}
+	streamWire := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPDoStream)[0])
+	if streamWire["operation_id"] != opID {
+		t.Fatalf("do_stream did not carry the operation id: %v", streamWire)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	cancels := f.callsOf(pluginabi.MethodHostHTTPCancel)
+	if len(cancels) != 1 {
+		t.Fatalf("cancel calls = %d, want 1 on pump exit", len(cancels))
+	}
+	var wire struct {
+		OperationID string `json:"operation_id"`
+	}
+	if err := json.Unmarshal(cancels[0].payload, &wire); err != nil {
+		t.Fatalf("cancel payload: %v", err)
+	}
+	if wire.OperationID != opID {
+		t.Fatalf("cancelled operation = %q, want %q", wire.OperationID, opID)
+	}
+}
+
+// TestExecuteStreamOperationCarriesHostCallbackID pins the client-abort
+// plumbing's second half: the operation must be opened on a bridge scoped to
+// THIS request's host callback id. The host resolves the operation's parent
+// context from that callback context — the client request's own context — so
+// without the id the operation is parented to context.Background() and a
+// client abort cannot reach the upstream at all (which is exactly the drain
+// until the 3m/30m watchdog this batch exists to remove).
+func TestExecuteStreamOperationCarriesHostCallbackID(t *testing.T) {
+	const cbID = "cb-request-99"
+	base := streamResponder(streamScript{
+		upstreamID: "up-cb",
+		frames:     []string{chatDelta("hi"), finishFrame(), "data: [DONE]\n\n"},
+	})
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostHTTPOperationOpen {
+			return hostOK(hostOperationOpenResp{OperationID: "op-cb"}), nil
+		}
+		return base(method, payload)
+	})
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	body, err := json.Marshal(executorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthProvider: ProviderID, AuthAttributes: map[string]string{"api_key": testKey},
+			Model: "ollama/glm-5.3", SourceFormat: "openai",
+			OriginalRequest: []byte(ccRequestBody), Stream: true,
+		},
+		StreamID:       "down-cb",
+		HostCallbackID: cbID,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	if env := decodeEnv(t, mustHandle(t, m, "executor.execute_stream", body)); !env.OK {
+		t.Fatalf("execute_stream: %+v", env.Error)
+	}
+	if got := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPOperationOpen)[0])["host_callback_id"]; got != cbID {
+		t.Fatalf("operation_open host_callback_id = %v, want %q", got, cbID)
+	}
+	if got := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPDoStream)[0])["host_callback_id"]; got != cbID {
+		t.Fatalf("do_stream host_callback_id = %v, want %q", got, cbID)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	if got := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPCancel)[0])["host_callback_id"]; got != cbID {
+		t.Fatalf("cancel host_callback_id = %v, want %q", got, cbID)
+	}
+}
+
+// TestExecuteStreamOperationOpenFailureIsNonFatal pins the degrade path: a
+// host without the operation bridge answers with an error, and the request
+// must still stream (watchdog-bounded teardown) with no operation_id sent.
+func TestExecuteStreamOperationOpenFailureIsNonFatal(t *testing.T) {
+	base := streamResponder(streamScript{
+		upstreamID: "up-noop",
+		frames:     []string{chatDelta("hi"), finishFrame(), "data: [DONE]\n\n"},
+	})
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostHTTPOperationOpen {
+			return hostErr("unsupported", "unsupported host callback"), nil
+		}
+		return base(method, payload)
+	})
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	resp, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("ollama/glm-5.3", "openai", []byte(ccRequestBody), "down-noop"))
+	if err != nil || !decodeEnv(t, resp).OK {
+		t.Fatalf("execute_stream must survive a missing operation bridge: %s %v", resp, err)
+	}
+	streamWire := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPDoStream)[0])
+	if _, has := streamWire["operation_id"]; has {
+		t.Fatalf("operation_id sent without an open operation: %v", streamWire)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPCancel)); got != 0 {
+		t.Fatalf("cancel calls = %d, want 0 with no operation", got)
+	}
+}
+
+// TestExecuteStreamOperationCancelledOnStartFailure pins the pre-first-byte
+// cleanup: a do_stream transport failure must cancel the operation it opened
+// instead of leaking the host-side entry.
+func TestExecuteStreamOperationCancelledOnStartFailure(t *testing.T) {
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(multiRouteCatalog, func(method string, _ []byte) ([]byte, error) {
+		switch method {
+		case pluginabi.MethodHostHTTPOperationOpen:
+			return hostOK(hostOperationOpenResp{OperationID: "op-fail"}), nil
+		case pluginabi.MethodHostHTTPDoStream:
+			return nil, errors.New("cable cut")
+		}
+		return hostOK(map[string]any{}), nil
+	})
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	env := decodeEnv(t, mustHandle(t, m, "executor.execute_stream",
+		execStreamReqBody("ollama/glm-5.3", "openai", []byte(ccRequestBody), "down-fail")))
+	if env.OK || env.Error == nil || env.Error.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+	cancels := f.callsOf(pluginabi.MethodHostHTTPCancel)
+	if len(cancels) != 1 {
+		t.Fatalf("cancel calls = %d, want 1 after a start failure", len(cancels))
+	}
+}
+
+// TestExecuteStreamWatchdogCloseCarriesErrorDetail pins the structured
+// downstream close on the watchdog path: an idle timeout is a truncated
+// upstream stream (ErrorCodeStreamTruncated) so the host skips credential
+// cooldown and does not replay the request, while the client still sees 504.
+func TestExecuteStreamWatchdogCloseCarriesErrorDetail(t *testing.T) {
+	h := newTimedStreamHost(timedRead{after: 5 * time.Millisecond, payload: chatDelta("progress")})
+	_, f := startTimedStream(t, h,
+		timeoutSettings(100*time.Millisecond, 70*time.Millisecond, 400*time.Millisecond, 20*time.Millisecond),
+		ccRequestBody, testKey)
+	var wire struct {
+		StreamID    string           `json:"stream_id"`
+		Error       string           `json:"error"`
+		ErrorDetail *pluginabi.Error `json:"error_detail"`
+	}
+	if err := json.Unmarshal([]byte(downstreamClose(t, f)), &wire); err != nil {
+		t.Fatalf("close payload: %v", err)
+	}
+	if !strings.Contains(wire.Error, "stream idle timeout") {
+		t.Fatalf("plain error lost the cause: %+v", wire)
+	}
+	if wire.ErrorDetail == nil {
+		t.Fatal("watchdog close carried no error_detail")
+	}
+	if wire.ErrorDetail.Code != pluginabi.ErrorCodeStreamTruncated ||
+		wire.ErrorDetail.HTTPStatus != http.StatusGatewayTimeout {
+		t.Fatalf("error_detail = %+v, want stream_truncated/504", wire.ErrorDetail)
+	}
+}
+
+// TestExecuteStreamTerminalErrorCarriesErrorDetail pins the converter
+// terminal path: a classified translation failure must reach the downstream
+// close as error_detail so the client sees 400 instead of the host's
+// status-less default for a message-only close.
+func TestExecuteStreamTerminalErrorCarriesErrorDetail(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{
+		upstreamID: "up-detail",
+		frames: []string{
+			`{"type":"message_start","message":{"id":"m1","model":"glm-5.3","usage":{"input_tokens":1}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","id":"blk"}}`,
+			`{"type":"input_json_delta","index":0,"delta":{"partial_json":"x"}}`,
+		},
+	})
+	if _, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("ollama/minimax-m3", "claude", []byte(claudeRequestBody), "down-detail")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(f.callsOf(pluginabi.MethodHostStreamClose)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	var payload []byte
+	for _, c := range f.callsOf(pluginabi.MethodHostStreamClose) {
+		if strings.Contains(string(c.payload), `"down-detail"`) {
+			payload = c.payload
+		}
+	}
+	if payload == nil {
+		t.Fatal("downstream stream was never closed")
+	}
+	var wire struct {
+		ErrorDetail *pluginabi.Error `json:"error_detail"`
+	}
+	if err := json.Unmarshal(payload, &wire); err != nil {
+		t.Fatalf("close payload: %v", err)
+	}
+	if wire.ErrorDetail == nil {
+		t.Fatalf("downstream close carried no error_detail: %s", payload)
+	}
+	if wire.ErrorDetail.Code != string(errclass.ClassTranslation) ||
+		wire.ErrorDetail.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("error_detail = %+v, want translation_failure/400", wire.ErrorDetail)
+	}
+}
+
+// TestExecuteNonStreamCarriesUpstreamRetryAfter pins the envelope retry hint:
+// pluginabi.Error carries RetryAfterSeconds (older hosts ignore it), and the
+// v8 conductor times the credential cooldown from it — a 429 with
+// "Retry-After: 30" must surface as retry_after_seconds=30 instead of being
+// re-treated as the default burn.
+func TestExecuteNonStreamCarriesUpstreamRetryAfter(t *testing.T) {
+	f := &fakeCaller{responder: wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		var wire map[string]any
+		_ = json.Unmarshal(payload, &wire)
+		if url, _ := wire["url"].(string); strings.HasSuffix(url, "/chat/completions") {
+			return hostOK(pluginapi.HTTPResponse{
+				StatusCode: http.StatusTooManyRequests,
+				Headers:    http.Header{"Retry-After": []string{"30"}},
+				Body:       []byte(`{"error":{"message":"rate limited"}}`),
+			}), nil
+		}
+		return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(ccResponseBody)}), nil
+	})}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	env := mustExecute(t, m, "ollama/glm-5.3", "openai", []byte(ccRequestBody))
+	if env.OK || env.Error == nil {
+		t.Fatalf("want error envelope, got %+v", env)
+	}
+	if env.Error.Code != string(errclass.ClassRateLimit) || env.Error.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("classification = %+v", env.Error)
+	}
+	if env.Error.RetryAfterSeconds != 30 {
+		t.Fatalf("retry_after_seconds = %d, want 30 from the upstream Retry-After header", env.Error.RetryAfterSeconds)
+	}
+}
+
+// TestExecuteStreamStatusCarriesUpstreamRetryAfter is the stream-side twin:
+// the pre-first-byte >=400 path used to discard the do_stream response
+// headers entirely, losing the upstream's retry guidance.
+func TestExecuteStreamStatusCarriesUpstreamRetryAfter(t *testing.T) {
+	f := &fakeCaller{responder: wrapWithCatalog(multiRouteCatalog, func(method string, _ []byte) ([]byte, error) {
+		switch method {
+		case pluginabi.MethodHostHTTPDoStream:
+			return hostOK(hostStreamStartResp{
+				StatusCode: http.StatusTooManyRequests,
+				Headers:    http.Header{"Retry-After": []string{"17"}},
+				StreamID:   "up-429",
+			}), nil
+		case pluginabi.MethodHostHTTPStreamRead:
+			return hostOK(hostStreamReadResp{Payload: []byte(`{"error":{"message":"slow down"}}`), Done: true}), nil
+		}
+		return hostOK(map[string]any{}), nil
+	})}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+testRouteOverrides)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	env := decodeEnv(t, mustHandle(t, m, "executor.execute_stream",
+		execStreamReqBody("ollama/glm-5.3", "openai", []byte(ccRequestBody), "down-429")))
+	if env.OK || env.Error == nil {
+		t.Fatalf("want error envelope, got %+v", env)
+	}
+	if env.Error.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("classification = %+v", env.Error)
+	}
+	if env.Error.RetryAfterSeconds != 17 {
+		t.Fatalf("retry_after_seconds = %d, want 17 from the do_stream response headers", env.Error.RetryAfterSeconds)
 	}
 }

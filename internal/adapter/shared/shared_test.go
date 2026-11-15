@@ -2,6 +2,7 @@ package shared
 
 import (
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -340,6 +341,148 @@ func TestUpstreamStatusError(t *testing.T) {
 	}
 }
 
+// cloudflareChallengeBody is a realistic Cloudflare interstitial: the markers
+// ("<title>Just a moment...</title>", "challenge-platform", the cf-mitigated
+// hint) are hundreds of bytes in, far past the 80-character snippet, which is
+// exactly why the classifier must inspect the full body.
+func cloudflareChallengeBody() []byte {
+	return []byte(`<!DOCTYPE html><html lang="en-US"><head><meta charset="UTF-8">` +
+		`<meta name="viewport" content="width=device-width, initial-scale=1.0">` +
+		`<meta http-equiv="X-UA-Compatible" content="IE=edge"><title>Just a moment...</title>` +
+		`<style>*{margin:0;padding:0}body{font-family:system-ui}</style>` +
+		`<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script>` +
+		`</head><body><div id="cf-wrapper"><noscript>Please enable JavaScript.</noscript>` +
+		`<span data-translate="attention_required">Attention Required!</span>` +
+		`</div><div id="challenge-running"></div></body></html>`)
+}
+
+// TestUpstreamStatusErrorCloudflareChallenge pins the CF classifier: a 403
+// whose markers sit past the snippet must read as an upstream/retryable
+// failure carrying the host's "cloudflare challenge" phrase — otherwise it
+// looks like a plain auth failure and the credential gets burned.
+func TestUpstreamStatusErrorCloudflareChallenge(t *testing.T) {
+	body := cloudflareChallengeBody()
+	if i := strings.Index(strings.ToLower(string(body)), "just a moment"); i <= 80 {
+		t.Fatalf("test body must place markers past the 80-char snippet, got offset %d", i)
+	}
+	e := UpstreamStatusError(403, body)
+	if e.Class != errclass.ClassUpstream {
+		t.Fatalf("class = %q, want %q", e.Class, errclass.ClassUpstream)
+	}
+	if !e.Retryable {
+		t.Fatal("cloudflare challenge must be retryable")
+	}
+	if e.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403", e.StatusCode)
+	}
+	if !strings.HasPrefix(e.Message, "cloudflare challenge: ") {
+		t.Fatalf("message must carry the host phrase first: %q", e.Message)
+	}
+	// FR-011: the snippet stays bounded even though the full body was scanned.
+	if len(e.Message) > len("cloudflare challenge: ")+83 {
+		t.Fatalf("snippet widened: %d chars", len(e.Message))
+	}
+
+	// Marker-only variants, each past the snippet head.
+	for name, marker := range map[string]string{
+		"challenge-platform": "/cdn-cgi/challenge-platform/h/b",
+		"cf-mitigated":       `{"detail":"cf-mitigated"}`,
+		"just a moment":      "<title>Just a moment...</title>",
+		"attention required": "Attention Required!",
+	} {
+		pad := strings.Repeat("<html><body>padding padding padding padding padding ", 4)
+		for _, form := range []string{
+			strings.Repeat("x", 200) + marker,
+			pad + marker,
+			strings.ToUpper(pad) + strings.ToUpper(marker),
+		} {
+			got := UpstreamStatusError(403, []byte(form))
+			if got.Class != errclass.ClassUpstream || !got.Retryable ||
+				!strings.HasPrefix(got.Message, "cloudflare challenge: ") {
+				t.Fatalf("%s: classification = %+v", name, got)
+			}
+		}
+	}
+
+	// The reclassification is 403-only: a 500 with the same body is already
+	// upstream, must not gain the phrase, and keeps its own message.
+	e = UpstreamStatusError(500, body)
+	if strings.Contains(e.Message, "cloudflare challenge") {
+		t.Fatalf("500 must not be reclassified as a challenge: %q", e.Message)
+	}
+}
+
+// TestUpstreamStatusErrorPlainForbidden pins the other half: an ordinary 403
+// keeps auth treatment (and never gains the challenge phrase).
+func TestUpstreamStatusErrorPlainForbidden(t *testing.T) {
+	for name, body := range map[string]string{
+		"auth wording":       `{"error":{"message":"invalid api key","type":"authentication_error"}}`,
+		"forbidden":          `{"error":"forbidden"}`,
+		"empty":              ``,
+		"html not a cf page": `<html><body><h1>403 Forbidden</h1><p>You do not have access.</p></body></html>`,
+	} {
+		e := UpstreamStatusError(403, []byte(body))
+		if e.Class != errclass.ClassAuth {
+			t.Fatalf("%s: class = %q, want auth", name, e.Class)
+		}
+		if strings.Contains(e.Message, "cloudflare challenge") {
+			t.Fatalf("%s: plain 403 gained the challenge phrase: %q", name, e.Message)
+		}
+		if e.StatusCode != 403 {
+			t.Fatalf("%s: status = %d", name, e.StatusCode)
+		}
+	}
+}
+
+// TestRetryAfterSeconds pins the delta-seconds parse of the upstream retry
+// hint: the host's conductor times the credential cooldown from it, so a
+// missing/misplaced/misparsed value must degrade to "no hint" rather than to
+// a wrong cooldown, and a buggy upstream must not pin a credential forever.
+func TestRetryAfterSeconds(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers http.Header
+		want    int
+	}{
+		{"absent header", http.Header{}, 0},
+		{"nil headers", nil, 0},
+		{"present", http.Header{"Retry-After": []string{"30"}}, 30},
+		{"surrounding spaces", http.Header{"Retry-After": []string{" 7 "}}, 7},
+		{"non-numeric", http.Header{"Retry-After": []string{"soon"}}, 0},
+		{"HTTP-date form ignored", http.Header{"Retry-After": []string{"Wed, 21 Oct 2026 07:28:00 GMT"}}, 0},
+		{"zero", http.Header{"Retry-After": []string{"0"}}, 0},
+		{"negative", http.Header{"Retry-After": []string{"-5"}}, 0},
+		{"capped at one hour", http.Header{"Retry-After": []string{"86400"}}, 3600},
+		{"exactly one hour", http.Header{"Retry-After": []string{"3600"}}, 3600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RetryAfterSeconds(tc.headers); got != tc.want {
+				t.Fatalf("RetryAfterSeconds(%v) = %d, want %d", tc.headers, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpstreamStatusErrorWithHeaders pins the classification+retry coupling on
+// the executor's >=400 path: the status classification must survive and the
+// Retry-After hint must ride along for the host conductor.
+func TestUpstreamStatusErrorWithHeaders(t *testing.T) {
+	e := UpstreamStatusErrorWithHeaders(429, []byte(`{"error":{"message":"rate limited"}}`),
+		http.Header{"Retry-After": []string{"45"}})
+	if e.Class != errclass.ClassRateLimit || e.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("classification = %+v", e)
+	}
+	if e.RetryAfterSeconds != 45 {
+		t.Fatalf("RetryAfterSeconds = %d, want 45", e.RetryAfterSeconds)
+	}
+	// No header: classification unchanged, hint stays absent.
+	e = UpstreamStatusErrorWithHeaders(503, []byte("down"), nil)
+	if e.Class != errclass.ClassUpstream || e.RetryAfterSeconds != 0 {
+		t.Fatalf("headerless = %+v", e)
+	}
+}
+
 func equalJSON(a, b any) bool {
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)
@@ -382,6 +525,11 @@ func TestFunctionTool(t *testing.T) {
 
 func TestUnsupportedFormat(t *testing.T) {
 	eErr := UnsupportedFormat("grpc", "/v1/responses")
+	// 422 keeps the failure request-scoped on the host: a status-0 error maps
+	// to 500 there and penalizes a credential for a client-body problem.
+	if eErr.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("UnsupportedFormat status = %d, want 422", eErr.StatusCode)
+	}
 	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
 		eErr.Message != `source protocol "grpc" cannot be translated to /v1/responses` {
 		t.Fatalf("err = %+v", eErr)
@@ -654,17 +802,170 @@ func TestRewriteModelIDPreservesBigIntegers(t *testing.T) {
 	}
 }
 
-// A catalog model id containing a quote cannot form a valid JSON string;
-// the rewrite must fail with a Translation error, never nil-body-nil-error
-// (which would POST an empty upstream body).
-func TestRewriteModelIDUnrepresentableModelID(t *testing.T) {
-	out, eErr := RewriteModelID(`we"ird`, []byte(`{"model":"x","messages":[]}`), "openai")
-	if eErr == nil || eErr.Class != errclass.ClassTranslation ||
-		!strings.Contains(eErr.Message, "model id cannot be represented as JSON") {
-		t.Fatalf("err = %v, out = %s", eErr, out)
+// A catalog model id containing a quote used to be unrepresentable because
+// the rewrite concatenated `"`+id+`"`. sjson JSON-encodes the value, so the
+// id now survives round-trip instead of failing the request; invalid UTF-8 is
+// the only remaining unrepresentable case (encoding would swap it for U+FFFD
+// and silently send a different model).
+func TestRewriteModelIDEscapedModelID(t *testing.T) {
+	for name, id := range map[string]string{
+		"quote":       `we"ird`,
+		"backslash":   `a\b`,
+		"control":     "a\x01b",
+		"non-ascii":   "mødel",
+		"angle+amp":   "a<b&c",
+		"slash-quote": `a/"b`,
+	} {
+		out, eErr := RewriteModelID(id, []byte(`{"model":"x","messages":[{"role":"user"}]}`), "openai")
+		if eErr != nil {
+			t.Fatalf("%s: %v", name, eErr)
+		}
+		if !json.Valid(out) {
+			t.Fatalf("%s: output is not JSON: %s", name, out)
+		}
+		var got struct {
+			Model    string            `json:"model"`
+			Messages []json.RawMessage `json:"messages"`
+		}
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("%s: output not decodable: %v (%s)", name, err, out)
+		}
+		if got.Model != id {
+			t.Fatalf("%s: model round-trip = %q, want %q", name, got.Model, id)
+		}
+		if len(got.Messages) != 1 {
+			t.Fatalf("%s: sibling lost: %s", name, out)
+		}
+	}
+
+	// Invalid UTF-8 cannot round-trip: reject rather than rewrite the model to
+	// something else behind the caller's back.
+	out, eErr := RewriteModelID("a\xffb", []byte(`{"model":"x"}`), "openai")
+	if eErr == nil || eErr.Class != errclass.ClassTranslation || !strings.Contains(eErr.Message, "UTF-8") {
+		t.Fatalf("invalid UTF-8 id: err = %v", eErr)
 	}
 	if out != nil {
 		t.Fatalf("body must be nil on failure, got %s", out)
+	}
+}
+
+// TestRewriteModelIDPreservesBytes pins the single-pass guarantee: only the
+// model value's bytes change, so field order, whitespace, and every nested
+// value survive exactly. The old decode/remarshal rebuilt the document in
+// alphabetical key order, which rewrote every byte of a long prompt and could
+// defeat upstream prompt-prefix caching.
+func TestRewriteModelIDPreservesBytes(t *testing.T) {
+	// Deliberately non-alphabetical, non-canonical whitespace.
+	body := []byte("{\n  \"z_last\": 1,\n  \"model\" : \"client-id\",\n  \"a_first\": {\"nested\": [1, 2, {\"b\": true}]},\n  \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]\n}\n")
+	out, eErr := RewriteModelID("upstream-id", body, "openai")
+	if eErr != nil {
+		t.Fatalf("rewrite: %v", eErr)
+	}
+	want := strings.Replace(string(body), `"client-id"`, `"upstream-id"`, 1)
+	if string(out) != want {
+		t.Fatalf("rewrite changed bytes outside the model value:\n got %q\nwant %q", out, want)
+	}
+
+	// Trailing newline, absi suffix inside text and large integers survive.
+	big := []byte(`{"model":"x","messages":[{"role":"user","content":"call 9007199254740993 twice"}]}`)
+	bigOut, eErr := RewriteModelID("glm-5.2", big, "openai")
+	if eErr != nil {
+		t.Fatalf("big int rewrite: %v", eErr)
+	}
+	if want := `{"model":"glm-5.2","messages":[{"role":"user","content":"call 9007199254740993 twice"}]}`; string(bigOut) != want {
+		t.Fatalf("big-int body altered:\n got %s\nwant %s", bigOut, want)
+	}
+}
+
+// TestRewriteModelIDNullAndNonObjectBodies pins the pre-sjson validation gate.
+// sjson does not validate: given `null` it happily produces {"model":...},
+// and given corrupt input it appends a bogus member. Neither may escape.
+func TestRewriteModelIDNullAndNonObjectBodies(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("non-object body panicked: %v", r)
+		}
+	}()
+	cases := map[string]struct{ body, wantMsg string }{
+		"null":          {`null`, "JSON null"},
+		"array":         {`[1]`, "malformed openai request JSON"},
+		"string":        {`"just a string"`, "malformed openai request JSON"},
+		"number":        {`42`, "malformed openai request JSON"},
+		"bool":          {`true`, "malformed openai request JSON"},
+		"empty":         {``, "malformed openai request JSON"},
+		"whitespace":    {"  \n\t ", "malformed openai request JSON"},
+		"truncated":     {`{"model":`, "malformed openai request JSON"},
+		"trailing junk": {`{"model":"x"} extra`, "malformed openai request JSON"},
+	}
+	for name, tc := range cases {
+		out, eErr := RewriteModelID("glm-5.2", []byte(tc.body), "openai")
+		if eErr == nil || eErr.Class != errclass.ClassTranslation {
+			t.Fatalf("%s: err = %v, want translation failure", name, eErr)
+		}
+		if !strings.Contains(eErr.Message, tc.wantMsg) {
+			t.Fatalf("%s: message = %q, want it to mention %q", name, eErr.Message, tc.wantMsg)
+		}
+		if out != nil {
+			t.Fatalf("%s: body must be nil on failure, got %s", name, out)
+		}
+	}
+}
+
+// A body that repeats the top-level model key must not end up carrying two
+// model values: sjson rewrites the FIRST match, while the upstream (and
+// encoding/json) take the LAST.
+func TestRewriteModelIDDuplicateModelKeys(t *testing.T) {
+	out, eErr := RewriteModelID("glm-5.2", []byte(`{"model":"first","z":1,"model":"last"}`), "openai")
+	if eErr != nil {
+		t.Fatalf("duplicate-key rewrite: %v", eErr)
+	}
+	if n := strings.Count(string(out), `"model"`); n != 1 {
+		t.Fatalf("duplicate model keys survived (%d): %s", n, out)
+	}
+	var got struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil || got.Model != "glm-5.2" {
+		t.Fatalf("model = %q (%v), want the rewrite to be the only value: %s", got.Model, err, out)
+	}
+
+	// A NESTED model property is not the top-level field and must keep the
+	// byte-preserving fast path.
+	nested := []byte(`{"model":"x","json_schema":{"model":"nested"},"z":1}`)
+	out, eErr = RewriteModelID("glm-5.2", nested, "openai")
+	if eErr != nil {
+		t.Fatalf("nested-model rewrite: %v", eErr)
+	}
+	want := `{"model":"glm-5.2","json_schema":{"model":"nested"},"z":1}`
+	if string(out) != want {
+		t.Fatalf("nested model property disturbed:\n got %s\nwant %s", out, want)
+	}
+
+	// The trap: the FIRST model already equals the upstream id while a later
+	// duplicate differs. A first-match no-op would return the body untouched
+	// and the upstream (last-wins) would serve the wrong model.
+	out, eErr = RewriteModelID("glm-5.2", []byte(`{"model":"glm-5.2","z":1,"model":"client-id"}`), "openai")
+	if eErr != nil {
+		t.Fatalf("duplicate no-op trap: %v", eErr)
+	}
+	got = struct {
+		Model string `json:"model"`
+	}{}
+	if err := json.Unmarshal(out, &got); err != nil || got.Model != "glm-5.2" {
+		t.Fatalf("trap model = %q (%v): %s", got.Model, err, out)
+	}
+	if n := strings.Count(string(out), `"model"`); n != 1 {
+		t.Fatalf("trap left %d model keys: %s", n, out)
+	}
+
+	// A nested model property does not defeat the byte-identical no-op.
+	noop := []byte(`{"model":"glm-5.2","schema":{"model":"s"},"z":1}`)
+	noopOut, eErr := RewriteModelID("glm-5.2", noop, "openai")
+	if eErr != nil {
+		t.Fatalf("nested no-op: %v", eErr)
+	}
+	if &noopOut[0] != &noop[0] {
+		t.Fatal("nested-model no-op must return the original body, not a copy")
 	}
 }
 
@@ -864,6 +1165,7 @@ func TestResponseStatusInverseKernels(t *testing.T) {
 
 	eErr := UnsupportedPartType("audio", "/v1/chat/completions")
 	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
+		eErr.StatusCode != http.StatusUnprocessableEntity ||
 		eErr.Message != `unsupported content block type "audio" for /v1/chat/completions` {
 		t.Errorf("UnsupportedPartType = %v", eErr)
 	}

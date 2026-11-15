@@ -18,7 +18,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"ollama-cliproxyapi/internal/config"
 )
@@ -138,7 +138,11 @@ type Manager struct {
 	cfg    config.Config
 	client HostClient
 
-	mu sync.Mutex
+	// mu guards the snapshot AND the HTTP validators below. Writes land once
+	// per refresh interval while Lookup/Models/Unsupported/Warnings run on
+	// every client request, so readers take RLock: a request must never queue
+	// behind a refresh's (potentially slow) snapshot build.
+	mu sync.RWMutex
 	// raw retains the decoded upstream entries behind the current snapshot
 	// so SeedFrom can rebuild records against a NEW config (route overrides,
 	// protocol flags, and prefix settings may all have changed since the
@@ -150,6 +154,11 @@ type Manager struct {
 	index map[string]ModelRecord
 	unsup []UnsupportedModel
 	warns []string
+	// etag/lastModified are the validators of the last successful (200)
+	// catalog response, replayed as If-None-Match / If-Modified-Since so an
+	// unchanged catalog costs a 304 and no body transfer.
+	etag         string
+	lastModified string
 }
 
 // New returns a Manager serving cfg through the host client.
@@ -172,9 +181,12 @@ func New(cfg config.Config, client HostClient) *Manager {
 // its routes immediately instead of serving stale routable records until the
 // outage ends.
 func (m *Manager) SeedFrom(prev *Manager) {
-	prev.mu.Lock()
+	prev.mu.RLock()
 	raw := prev.raw
-	prev.mu.Unlock()
+	prev.mu.RUnlock()
+	// Validators are deliberately NOT inherited: seed may run against a
+	// different catalog-url, and a stale ETag would then 304 a snapshot from
+	// the wrong resource. The cost is one unconditional GET after reconfigure.
 	m.swap(raw)
 }
 
@@ -189,17 +201,40 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 		// classified path instead of panicking inside Do.
 		return m.fail("host client unavailable")
 	}
+	headers := http.Header{
+		"Authorization": []string{"Bearer " + apiKey},
+		"Accept":        []string{"application/json"},
+	}
+	// Conditional GET: replay the validators of the last successful response.
+	// An unchanged catalog then costs a 304 and no body transfer, which is the
+	// common case for a refresh interval shorter than the upstream's change
+	// cadence. Validators are read under the lock; on 304 nothing is swapped,
+	// so the snapshot (and its diagnostics) survive untouched — strictly
+	// better than stale-while-unavailable, which only covers failures.
+	m.mu.RLock()
+	etag, lastModified := m.etag, m.lastModified
+	m.mu.RUnlock()
+	if etag != "" {
+		headers.Set("If-None-Match", etag)
+	}
+	if lastModified != "" {
+		headers.Set("If-Modified-Since", lastModified)
+	}
 	req := pluginapi.HTTPRequest{
-		Method: http.MethodGet,
-		URL:    m.cfg.CatalogURL,
-		Headers: http.Header{
-			"Authorization": []string{"Bearer " + apiKey},
-			"Accept":        []string{"application/json"},
-		},
+		Method:  http.MethodGet,
+		URL:     m.cfg.CatalogURL,
+		Headers: headers,
 	}
 	resp, err := m.client.Do(ctx, req)
 	if err != nil {
 		return m.fail("network error")
+	}
+	if resp.StatusCode == http.StatusNotModified {
+		// Nothing changed upstream: keep serving the current snapshot verbatim.
+		// A 304 with no validators sent would be a protocol violation, but it
+		// is still a no-op refresh rather than a failure — failing would clear
+		// a good snapshot under fail-closed for no reason.
+		return nil
 	}
 	budget := max(m.cfg.MaxResponseBytes, catalogBudgetFloor)
 	if int64(len(resp.Body)) > budget {
@@ -228,6 +263,13 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 	} else if err := json.Unmarshal(env.Data, &entries); err != nil {
 		return m.fail("invalid json")
 	}
+	// Record the validators with the snapshot they describe. A 200 without
+	// either header clears them: keeping a stale ETag would make the next
+	// refresh depend on an entity tag the upstream no longer honors.
+	m.mu.Lock()
+	m.etag = resp.Headers.Get("ETag")
+	m.lastModified = resp.Headers.Get("Last-Modified")
+	m.mu.Unlock()
 	m.swap(entries, warns...)
 	return nil
 }
@@ -500,8 +542,8 @@ func normalizeThinking(rt *rawThinking) *pluginapi.ThinkingSupport {
 // is a shallow copy; records are rebuilt fresh on every swap and consumers
 // treat them as read-only, so nested slices/thinking are shared safely.
 func (m *Manager) Models() []ModelRecord {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]ModelRecord, len(m.models))
 	copy(out, m.models)
 	return out
@@ -511,16 +553,16 @@ func (m *Manager) Models() []ModelRecord {
 // (with or without prefix) or the bare upstream ID (FR-003): the PublicID
 // key wins over UpstreamID when both exist.
 func (m *Manager) Lookup(id string) (ModelRecord, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	rec, ok := m.index[id]
 	return rec, ok
 }
 
 // Unsupported returns models excluded from the routable set with reasons.
 func (m *Manager) Unsupported() []UnsupportedModel {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]UnsupportedModel, len(m.unsup))
 	copy(out, m.unsup)
 	return out
@@ -528,8 +570,8 @@ func (m *Manager) Unsupported() []UnsupportedModel {
 
 // Warnings returns dedup and override diagnostics.
 func (m *Manager) Warnings() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]string, len(m.warns))
 	copy(out, m.warns)
 	return out

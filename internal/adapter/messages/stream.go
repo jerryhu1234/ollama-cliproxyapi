@@ -100,6 +100,15 @@ func (sc *StreamConverter) Feed(chunk []byte) (events [][]byte, done bool, eErr 
 func (sc *StreamConverter) observeFrame(etype, data string) {
 	var ev sseEvent
 	_ = json.Unmarshal([]byte(data), &ev)
+	// The framer returns etype="" for data-only frames; dispatch resolves the
+	// payload type into a local variable, and observation must resolve it too
+	// — otherwise a fully valid data-only stream converts fine but never marks
+	// Started/FinishSeen/TerminalSeen (Progress frozen at 0 makes the pump's
+	// first-data timer kill the healthy stream, and FinalizeStream contradicts
+	// Feed's done=true).
+	if etype == "" {
+		etype = ev.Type
+	}
 	switch etype {
 	case "message_start":
 		if !sc.streamState.Snapshot.Started {
@@ -300,9 +309,15 @@ func (sc *StreamConverter) dispatchOpenAI(etype string, ev *sseEvent, events *[]
 		sc.captureCache(ev.Usage)
 		// Observed tool calls outrank the status-derived reason: a
 		// terminal max_tokens cannot downgrade tool_calls to length.
-		sc.emitChunk(events, map[string]any{},
-			shared.TerminalReason(sc.toolsSeen, "tool_calls",
-				shared.ClaudeStopToFinish(ev.Delta.StopReason)), true)
+		// The finish chunk waits for an actual stop_reason: usage-only
+		// message_delta frames exist, and emitting the terminal frame on
+		// them closes the stream with a premature finish_reason while the
+		// real stop (or message_stop) is still to come.
+		if strings.TrimSpace(ev.Delta.StopReason) != "" {
+			sc.emitChunk(events, map[string]any{},
+				shared.TerminalReason(sc.toolsSeen, "tool_calls",
+					shared.ClaudeStopToFinish(ev.Delta.StopReason)), true)
+		}
 	case "message_stop":
 		return true, nil
 	case "error":
@@ -425,7 +440,11 @@ func (sc *StreamConverter) Flush() [][]byte {
 		return nil
 	}
 	sc.flushed = true
-	if !sc.emitted {
+	// A normally-terminated stream already emitted its terminal (message_stop
+	// synthesizes response.completed on the Responses target); Flush guards the
+	// same TerminalSeen condition FinalizeStream does so a late call never
+	// re-emits a second terminal.
+	if !sc.emitted || sc.streamState.Snapshot.TerminalSeen {
 		return nil
 	}
 	switch sc.sourceFormat {

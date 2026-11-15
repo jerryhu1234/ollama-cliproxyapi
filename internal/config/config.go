@@ -170,7 +170,13 @@ func Load(yamlBytes []byte) (Config, error) {
 	}
 	keys := make([]APIKey, len(raw.APIKeys))
 	for i, k := range raw.APIKeys {
-		keys[i] = APIKey{Value: os.ExpandEnv(k.Value)}
+		// Trim AFTER expansion: quoted YAML scalars and block scalars ("|")
+		// routinely carry a trailing newline, and the auth-record identity is
+		// sha256(raw value) — an untrimmed variant would materialize a SECOND
+		// credential card for the same key. Trimmed-empty values fall into the
+		// existing "expanded to empty" rejection; trimmed-equal values hit the
+		// existing duplicate check.
+		keys[i] = APIKey{Value: strings.TrimSpace(os.ExpandEnv(k.Value))}
 	}
 	refreshInterval, err := parseDuration("catalog.refresh-interval", raw.Catalog.RefreshInterval, DefaultRefreshInterval)
 	if err != nil {

@@ -2,9 +2,11 @@ package errclass
 
 import (
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 func TestClassConstants(t *testing.T) {
@@ -69,9 +71,49 @@ func TestFromStatus(t *testing.T) {
 	}
 }
 
+// TestCloudflareChallengeClassification pins the WAF-interstitial rule at the
+// errclass level: Cloudflare fronts ollama.com, so a challenge arrives as an
+// ordinary 403 whose markers ("Just a moment...", "challenge-platform")
+// usually sit deep in the HTML. Callers that never go through
+// shared.UpstreamStatusError (adapter stream-error paths) must classify it the
+// same way — ClassUpstream + retryable + the host's "cloudflare challenge"
+// phrase — while a plain 403 keeps auth treatment.
+func TestCloudflareChallengeClassification(t *testing.T) {
+	challenge := `<!DOCTYPE html><html><head><meta charset="UTF-8">` +
+		`<meta http-equiv="X-UA-Compatible" content="IE=edge"><title>Just a moment...</title>` +
+		`<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script>` +
+		`</head><body><div id="cf-wrapper">Attention Required!</div></body></html>`
+	if !IsCloudflareChallengeText(challenge) {
+		t.Fatal("IsCloudflareChallengeText missed a real challenge page")
+	}
+	e := FromStatus(403, challenge)
+	if e.Class != ClassUpstream || !e.Retryable || e.StatusCode != 403 {
+		t.Fatalf("classification = %+v", e)
+	}
+	if !strings.HasPrefix(e.Message, "cloudflare challenge: ") {
+		t.Fatalf("message = %q", e.Message)
+	}
+	// A message that already carries the phrase is not prefixed twice.
+	if got := FromStatus(403, "cloudflare challenge: just a moment").Message; strings.Count(got, "cloudflare challenge") != 1 {
+		t.Fatalf("double prefix: %q", got)
+	}
+	// The upgrade is 403-only.
+	if got := FromStatus(429, challenge); strings.Contains(got.Message, "cloudflare challenge") {
+		t.Fatalf("429 gained the challenge phrase: %q", got.Message)
+	}
+	for _, plain := range []string{`{"error":"forbidden"}`, "", "<html><body>403 Forbidden</body></html>"} {
+		if IsCloudflareChallengeText(plain) {
+			t.Fatalf("false positive on %q", plain)
+		}
+		if got := FromStatus(403, plain); got.Class != ClassAuth {
+			t.Fatalf("%q: class = %q, want auth", plain, got.Class)
+		}
+	}
+}
+
 func TestFromNetwork(t *testing.T) {
 	e := FromNetwork(errors.New("dial tcp: refused"))
-	if e.Class != ClassNetwork || !e.Retryable || e.StatusCode != 0 ||
+	if e.Class != ClassNetwork || !e.Retryable || e.StatusCode != http.StatusBadGateway ||
 		e.Message != "dial tcp: refused" {
 		t.Errorf("FromNetwork(err) = %+v", e)
 	}
@@ -83,8 +125,25 @@ func TestFromNetwork(t *testing.T) {
 
 func TestTranslation(t *testing.T) {
 	e := Translation("cannot map tool calls")
-	if e.Class != ClassTranslation || e.Retryable || e.StatusCode != 0 {
+	if e.Class != ClassTranslation || e.Retryable || e.StatusCode != http.StatusBadRequest {
 		t.Errorf("Translation() = %+v", e)
+	}
+}
+
+// TestZeroStatusConstructorsCarryHostVisibleHTTPStatus pins the constructors
+// for request-side and network-side failures to real HTTP statuses: the host
+// maps HTTPStatus 0 to 500 and then either cools/rotates the credential or
+// reports a generic server error, for what is actually a malformed client
+// request (400) or an upstream transport failure (502).
+func TestZeroStatusConstructorsCarryHostVisibleHTTPStatus(t *testing.T) {
+	if got := Translation("untranslatable body").StatusCode; got != http.StatusBadRequest {
+		t.Errorf("Translation status = %d, want 400", got)
+	}
+	if got := UpstreamFallback("stream broke").StatusCode; got != http.StatusBadGateway {
+		t.Errorf("UpstreamFallback status = %d, want 502", got)
+	}
+	if got := FromNetwork(errors.New("dial tcp: refused")).StatusCode; got != http.StatusBadGateway {
+		t.Errorf("FromNetwork status = %d, want 502", got)
 	}
 }
 
@@ -96,7 +155,7 @@ func TestUpstreamFallback(t *testing.T) {
 	if !e.Retryable {
 		t.Error("Retryable = false, want true (§7: upstream server failures are retryable)")
 	}
-	if e.StatusCode != 0 {
+	if e.StatusCode != http.StatusBadGateway {
 		t.Errorf("StatusCode = %+v", e)
 	}
 	want := "upstream stream broke: Bearer [redacted] mid-chunk"
@@ -128,6 +187,29 @@ func TestToEnvelopeError(t *testing.T) {
 	want := pluginabi.Error{Code: "auth_failure", Message: "Bearer [redacted] failed", Retryable: false, HTTPStatus: 401}
 	if got != want {
 		t.Errorf("ToEnvelopeError = %+v, want %+v", got, want)
+	}
+}
+
+// TestToEnvelopeErrorPropagatesRetryAndScope pins the v8 routing fields: the
+// conductor times cooldowns from RetryAfterSeconds and reads CredentialScoped
+// to widen a 429 from the model to the whole credential.
+func TestToEnvelopeErrorPropagatesRetryAndScope(t *testing.T) {
+	got := ToEnvelopeError(&Error{
+		Class:             ClassRateLimit,
+		Message:           "slow down",
+		StatusCode:        http.StatusTooManyRequests,
+		Retryable:         true,
+		RetryAfterSeconds: 30,
+		CredentialScoped:  true,
+	})
+	if got.RetryAfterSeconds != 30 {
+		t.Errorf("RetryAfterSeconds = %d, want 30", got.RetryAfterSeconds)
+	}
+	if !got.CredentialScoped || !got.IsCredentialScoped() {
+		t.Errorf("CredentialScoped not propagated: %+v", got)
+	}
+	if got.ErrorCode() != "rate_limit" || got.StatusCode() != http.StatusTooManyRequests {
+		t.Errorf("v8 routing fields = %+v", got)
 	}
 }
 
