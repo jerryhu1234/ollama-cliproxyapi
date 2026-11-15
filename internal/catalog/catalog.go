@@ -209,8 +209,11 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 	// An unchanged catalog then costs a 304 and no body transfer, which is the
 	// common case for a refresh interval shorter than the upstream's change
 	// cadence. Validators are read under the lock; on 304 nothing is swapped,
-	// so the snapshot (and its diagnostics) survive untouched — strictly
-	// better than stale-while-unavailable, which only covers failures.
+	// so the snapshot (and its diagnostics) survive untouched — provided it
+	// still exists, which is why fail() clears the validators alongside it
+	// and the 304 branch below refuses to succeed on an empty snapshot.
+	// Stale-while-unavailable remains the failure-window protection; the
+	// conditional GET is only the happy-path data saver.
 	m.mu.RLock()
 	etag, lastModified := m.etag, m.lastModified
 	m.mu.RUnlock()
@@ -231,10 +234,21 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 	}
 	if resp.StatusCode == http.StatusNotModified {
 		// Nothing changed upstream: keep serving the current snapshot verbatim.
-		// A 304 with no validators sent would be a protocol violation, but it
-		// is still a no-op refresh rather than a failure — failing would clear
-		// a good snapshot under fail-closed for no reason.
-		return nil
+		// A 304 is accepted as a no-op refresh only while the snapshot it
+		// validates still exists — a stale-while-unavailable-off wipe (fail())
+		// also clears the validators, so a 304 here means the upstream really
+		// has nothing new and the empty snapshot is NOT recoverable by
+		// retrying the conditional GET. Treating it as success would answer
+		// every refresh with 304 forever and leave the catalog empty until
+		// the upstream's ETag changes; failing instead makes the next tick
+		// issue an unconditional GET and rebuild.
+		m.mu.RLock()
+		empty := len(m.models) == 0
+		m.mu.RUnlock()
+		if !empty {
+			return nil
+		}
+		return m.fail("http 304 with an empty snapshot")
 	}
 	budget := max(m.cfg.MaxResponseBytes, catalogBudgetFloor)
 	if int64(len(resp.Body)) > budget {
@@ -274,7 +288,12 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 	return nil
 }
 
-// fail applies the stale policy and returns the classified error.
+// fail applies the stale policy and returns the classified error. Whenever
+// the snapshot is cleared, the validators go with it: a kept ETag would make
+// the next refresh replay If-None-Match against a healthy upstream, get a
+// 304, and (before the empty-snapshot guard in Refresh) pin the catalog
+// empty until the upstream's ETag changed. Clearing the validators costs one
+// unconditional GET and is what makes recovery possible at all.
 func (m *Manager) fail(category string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -283,6 +302,7 @@ func (m *Manager) fail(category string) error {
 		// records are gone (FR-002). Raw entries go with them: a cleared
 		// snapshot has nothing to seed.
 		m.raw, m.models, m.index, m.unsup, m.warns = nil, nil, nil, nil, nil
+		m.etag, m.lastModified = "", ""
 	}
 	return fmt.Errorf("catalog refresh failed: %s", category)
 }

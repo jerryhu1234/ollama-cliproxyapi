@@ -132,10 +132,14 @@ func RewriteModelID(upstreamModel string, body []byte, formatLabel string) ([]by
 	// pathological input, so they take the legacy decode path. The byte-count
 	// is only a gate (it also matches nested "model" properties and quoted
 	// mentions inside prompt text); the top-level scan decides, so a nested
-	// schema property keeps the byte-preserving fast path. A duplicate spelled
-	// with JSON escapes ("mo\u0064el") is not counted and would slip through —
-	// no JSON encoder emits that, and the alternative is an O(body) byte scan
-	// on every request.
+	// schema property keeps the byte-preserving fast path. A duplicate whose
+	// first occurrence is spelled with JSON escapes ("mo\u0064el") escapes
+	// both gates: the fast path splices the escaped (gjson-resolved) key and
+	// the request is routed to the client's UNrewritten model id — silently,
+	// with no error. Risk accepted deliberately: no mainstream JSON encoder
+	// emits escaped duplicate keys, detecting them needs an O(body) scan on
+	// every request (or a loud rejection of a pathological input), and either
+	// trade-off buys protection against input nothing produces.
 	if bytes.Count(body, []byte(`"model"`)) > 1 && countTopLevelModelKeys(body) > 1 {
 		return rewriteModelIDLastWins(upstreamModel, formatLabel, body)
 	}

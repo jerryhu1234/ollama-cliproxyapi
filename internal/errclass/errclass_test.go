@@ -101,6 +101,17 @@ func TestCloudflareChallengeClassification(t *testing.T) {
 	if got := FromStatus(429, challenge); strings.Contains(got.Message, "cloudflare challenge") {
 		t.Fatalf("429 gained the challenge phrase: %q", got.Message)
 	}
+	// "attention required" alone is NOT enough — a plain credential-403 whose
+	// message happens to carry the phrase must keep auth treatment (the host
+	// requires co-occurrence too); the phrase is the standard challenge-page
+	// title only in the presence of Cloudflare's own branding.
+	attentionOnly := `<!DOCTYPE html><html><head><title>Attention Required!</title></head></html>`
+	if IsCloudflareChallengeText(attentionOnly) {
+		t.Fatal("attention-required alone must not classify as a challenge")
+	}
+	if got := FromStatus(403, attentionOnly); got.Class != ClassAuth {
+		t.Fatalf("attention-only 403 class = %q, want auth", got.Class)
+	}
 	for _, plain := range []string{`{"error":"forbidden"}`, "", "<html><body>403 Forbidden</body></html>"} {
 		if IsCloudflareChallengeText(plain) {
 			t.Fatalf("false positive on %q", plain)

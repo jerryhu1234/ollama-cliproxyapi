@@ -319,6 +319,18 @@ func (sc *StreamConverter) dispatchOpenAI(etype string, ev *sseEvent, events *[]
 					shared.ClaudeStopToFinish(ev.Delta.StopReason)), true)
 		}
 	case "message_stop":
+		// Degenerate upstream case: a stream that reaches message_stop without
+		// any stop-bearing message_delta. Before the usage-only guard above
+		// this still produced a finish chunk (the first delta emitted one);
+		// now nothing would — an OpenAI target would see a completed stream
+		// with no finish_reason at all. Synthesize "stop" so the terminal
+		// contract holds for every stream shape; a stop-bearing delta already
+		// emitted its chunk, so this only fires where the chunk is missing.
+		if !sc.streamState.Snapshot.FinishSeen {
+			sc.streamState.Finish()
+			sc.emitChunk(events, map[string]any{},
+				shared.TerminalReason(sc.toolsSeen, "tool_calls", "stop"), false)
+		}
 		return true, nil
 	case "error":
 		return false, sseError(ev.Error)

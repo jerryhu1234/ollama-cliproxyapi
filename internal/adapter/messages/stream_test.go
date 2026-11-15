@@ -850,6 +850,33 @@ func TestFlushAfterMessageStopDoesNotReemitTerminal(t *testing.T) {
 	}
 }
 
+// TestOpenAITargetFinishWithoutStopReason pins the degenerate-shape fallback:
+// an upstream that ends at message_stop without ever sending a stop_reason
+// must still produce exactly one finish chunk (synthesized as "stop"), not a
+// stream that completes with no finish_reason at all.
+func TestOpenAITargetFinishWithoutStopReason(t *testing.T) {
+	sc := NewStreamConverter("openai")
+	all, _, eErr := feed(t, sc,
+		`data: {"type":"message_start","message":{"id":"m1","model":"glm-5.3","usage":{"input_tokens":5}}}`+"\n\n",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}`+"\n\n",
+		`data: {"type":"content_block_delta","index":0,"delta":{"text":"hi"}}`+"\n\n",
+		`data: {"type":"content_block_stop","index":0}`+"\n\n",
+		`data: {"type":"message_delta","delta":{},"usage":{"output_tokens":1}}`+"\n\n",
+		`data: {"type":"message_stop"}`+"\n\n")
+	if eErr != nil {
+		t.Fatalf("stream errored: %v", eErr)
+	}
+	finishes := 0
+	for _, e := range all {
+		if strings.Contains(string(e), `"finish_reason":"`) {
+			finishes++
+		}
+	}
+	if finishes != 1 {
+		t.Fatalf("finish chunks = %d, want exactly one synthesized at message_stop: %v", finishes, all)
+	}
+}
+
 // TestOpenAITargetFinishChunkFollowsStopReason pins the finish-chunk shape on
 // the chat-completions target: message_delta carries usage updates too, and a
 // usage-only delta must NOT close the stream with a premature finish_reason —

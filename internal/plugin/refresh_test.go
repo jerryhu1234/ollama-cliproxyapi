@@ -35,6 +35,10 @@ type authRecorder struct {
 	logs  [][]byte
 	// body, when non-empty, replaces testCatalogJSON as the served catalog.
 	body []byte
+	// failSecond makes every NON-cooled (second) key's request answer 304 —
+	// the "healthy credential, unchanged upstream" case that must not be
+	// mistaken for a successful rebuild of an empty snapshot.
+	failSecond bool
 }
 
 func (r *authRecorder) call(method string, payload []byte) ([]byte, error) {
@@ -56,9 +60,13 @@ func (r *authRecorder) call(method string, payload []byte) ([]byte, error) {
 	auth := wire.Headers.Get("Authorization")
 	r.mu.Lock()
 	r.auths = append(r.auths, auth)
+	failSecond := r.failSecond
 	r.mu.Unlock()
 	if auth == "Bearer "+cooledRefreshKey {
 		return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusUnauthorized}), nil
+	}
+	if failSecond {
+		return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusNotModified}), nil
 	}
 	body := testCatalogJSON
 	if len(r.body) > 0 {
@@ -81,6 +89,36 @@ func (r *authRecorder) logCalls() [][]byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([][]byte(nil), r.logs...)
+}
+
+// TestRefreshFailoverWithSecondKey404 pins the interaction the failover loop
+// exists for: a revoked first key wipes the fail-closed snapshot (and its
+// validators), so even a second key that only answers 304 — i.e. a catalog the
+// first key's era had already fetched — must NOT report success on an empty
+// snapshot. The 304 fails loudly, refreshOnce reports the failure, and the
+// next tick gets an unconditional GET.
+func TestRefreshFailoverSecondKey304OnEmptySnapshot(t *testing.T) {
+	cfg, mgr, bridge, rec := twoKeyFixture(t)
+	rec.mu.Lock()
+	rec.failSecond = true
+	rec.mu.Unlock()
+	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err == nil {
+		t.Fatal("failover must not report success when the second key cannot rebuild the empty snapshot")
+	}
+	if got := len(mgr.Models()); got != 0 {
+		t.Fatalf("snapshot after failed failover = %d models", got)
+	}
+	// Next tick: validators were cleared with the wiped snapshot, so even the
+	// healthy key's conditional-GET 304 trap is gone and recovery works.
+	rec.mu.Lock()
+	rec.failSecond = false
+	rec.mu.Unlock()
+	if err := refreshOnce(context.Background(), mgr, bridge, time.Second, cfg); err != nil {
+		t.Fatalf("recovery refresh: %v", err)
+	}
+	if len(mgr.Models()) == 0 {
+		t.Fatal("recovery installed no models")
+	}
 }
 
 func twoKeyFixture(t *testing.T) (config.Config, *catalog.Manager, *HostBridge, *authRecorder) {

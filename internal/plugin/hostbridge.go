@@ -258,10 +258,19 @@ func (b *HostBridge) callWithTimeoutResult(ctx context.Context, method string, p
 				res := <-done
 				func() {
 					// This bare goroutine is a host-process hazard twice
-					// over: a panic escaping it aborts CPA, and skipping
-					// settle would leak the inFlight count so shutdown
-					// waits out its whole drain window.
-					defer func() { _ = recover() }()
+					// over: abandon runs in a goroutine the host owns, so
+					// a panic escaping it aborts the whole CPA process, and
+					// skipping settle below would leak the inFlight count so
+					// shutdown waits out its whole drain window. The guard
+					// must WRAP abandon — anything else leaves the panic
+					// uncontained — and surfaces the value to host.log
+					// instead of swallowing it.
+					defer func() {
+						if r := recover(); r != nil {
+							_ = b.Log("error", "orphaned stream cleanup panicked",
+								map[string]any{"panic": fmt.Sprint(r)})
+						}
+					}()
 					abandon(res.raw)
 				}()
 				// Settled only after abandon fully completes, so shutdown

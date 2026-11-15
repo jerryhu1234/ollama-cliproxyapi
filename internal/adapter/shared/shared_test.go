@@ -388,7 +388,10 @@ func TestUpstreamStatusErrorCloudflareChallenge(t *testing.T) {
 		"challenge-platform": "/cdn-cgi/challenge-platform/h/b",
 		"cf-mitigated":       `{"detail":"cf-mitigated"}`,
 		"just a moment":      "<title>Just a moment...</title>",
-		"attention required": "Attention Required!",
+		// "attention required" needs Cloudflare co-occurrence — the standalone
+		// phrase is a legitimate credential-403 message and must keep auth
+		// treatment (see TestUpstreamStatusErrorPlainForbidden).
+		"attention required": "Attention Required! | Cloudflare",
 	} {
 		pad := strings.Repeat("<html><body>padding padding padding padding padding ", 4)
 		for _, form := range []string{
@@ -416,10 +419,14 @@ func TestUpstreamStatusErrorCloudflareChallenge(t *testing.T) {
 // keeps auth treatment (and never gains the challenge phrase).
 func TestUpstreamStatusErrorPlainForbidden(t *testing.T) {
 	for name, body := range map[string]string{
-		"auth wording":       `{"error":{"message":"invalid api key","type":"authentication_error"}}`,
-		"forbidden":          `{"error":"forbidden"}`,
-		"empty":              ``,
-		"html not a cf page": `<html><body><h1>403 Forbidden</h1><p>You do not have access.</p></body></html>`,
+		"auth wording": `{"error":{"message":"invalid api key","type":"authentication_error"}}`,
+		"forbidden":    `{"error":"forbidden"}`,
+		"empty":        ``,
+		// "attention required" WITHOUT Cloudflare branding: the host requires
+		// co-occurrence for this title, and a credential-403 JSON could carry
+		// the phrase — a false challenge prefix delays rotation.
+		"attention required alone": `{"error":{"message":"attention required before retry"}}`,
+		"html not a cf page":       `<html><body><h1>403 Forbidden</h1><p>You do not have access.</p></body></html>`,
 	} {
 		e := UpstreamStatusError(403, []byte(body))
 		if e.Class != errclass.ClassAuth {

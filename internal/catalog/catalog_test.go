@@ -1297,6 +1297,61 @@ func TestRefreshNotModifiedKeepsSnapshot(t *testing.T) {
 	}
 }
 
+// TestFailKeepsNoValidators pins the fail/conditional-GET state machine: a
+// failed refresh under stale-while-unavailable:false wipes the snapshot AND
+// the validators, so the NEXT refresh must be an unconditional GET that can
+// actually rebuild. This is the exact trap a retained ETag creates: a healthy
+// upstream would answer it with 304, and (before the empty-snapshot guard in
+// Refresh) every subsequent tick would "succeed" with an empty catalog
+// indefinitely.
+func TestFailKeepsNoValidators(t *testing.T) {
+	cfg := testCfg()
+	cfg.Catalog.StaleWhileUnavailable = false
+	fc := &fakeClient{resp: pluginapi.HTTPResponse{
+		StatusCode: 200,
+		Headers:    http.Header{"Etag": []string{`"v1"`}},
+		Body:       []byte(`{"data":[{"id":"glm-5.2"}]}`),
+	}}
+	m := newManager(cfg, fc)
+	mustRefresh(t, m)
+	if len(m.Models()) != 1 {
+		t.Fatalf("initial snapshot = %+v", m.Models())
+	}
+
+	// One failed refresh: network error after the validators were stored.
+	fc.set(pluginapi.HTTPResponse{}, errors.New("cable cut"))
+	if err := m.Refresh(context.Background(), testKey); err == nil {
+		t.Fatal("network failure must be reported, not swallowed")
+	}
+	if len(m.Models()) != 0 {
+		t.Fatalf("fail-closed snapshot = %+v", m.Models())
+	}
+
+	// Recovery: the first refresh after the failure must be unconditional —
+	// replaying "v1" here would 304 against the healthy upstream, and the
+	// empty snapshot would survive the whole ETag lifetime.
+	fc.set(pluginapi.HTTPResponse{StatusCode: 304}, nil)
+	if err := m.Refresh(context.Background(), testKey); err == nil {
+		t.Fatal("a 304 against an empty snapshot must fail, not report success")
+	}
+	if got := fc.gotReq.Headers.Get("If-None-Match"); got != "" {
+		t.Fatalf("post-failure refresh replayed ETag %q — the empty catalog would stay empty until the ETag changed", got)
+	}
+
+	fc.set(pluginapi.HTTPResponse{StatusCode: 200, Headers: http.Header{"Etag": []string{`"v1"`}},
+		Body: []byte(`{"data":[{"id":"glm-5.2"}]}`)}, nil)
+	mustRefresh(t, m)
+	if len(m.Models()) != 1 || m.Models()[0].UpstreamID != "glm-5.2" {
+		t.Fatalf("catalog after recovery = %+v", m.Models())
+	}
+	// And the retained validator is live again.
+	fc.set(pluginapi.HTTPResponse{StatusCode: 304}, nil)
+	mustRefresh(t, m)
+	if got := fc.gotReq.Headers.Get("If-None-Match"); got != `"v1"` {
+		t.Fatalf("recovered validator lost: If-None-Match = %q", got)
+	}
+}
+
 // TestReadPathsShareTheSnapshotLock pins the RWMutex conversion directly: the
 // accessors called on every client request must take a READ lock. Holding one
 // RLock and running them concurrently succeeds only if they do not demand the

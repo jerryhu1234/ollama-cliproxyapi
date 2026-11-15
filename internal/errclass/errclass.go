@@ -46,18 +46,24 @@ func (e *Error) Error() string {
 }
 
 // IsCloudflareChallengeText reports whether an upstream error text carries
-// Cloudflare challenge vocabulary: "just a moment" (the canonical challenge
-// page title), "challenge-platform", "cf-mitigated", "attention required", or
-// the "cloudflare challenge" phrase this plugin prefixes onto the snippet.
-// Cloudflare fronts ollama.com, so a bot/WAF interstitial arrives as an
-// otherwise ordinary HTTP 403.
+// Cloudflare challenge vocabulary. The predicate is deliberately close to the
+// host's own matcher (conductor_cooldown.go): the bare phrase, the canonical
+// "just a moment" title, or "attention required" — the other standard
+// challenge page title — but ONLY when "cloudflare" co-occurs with it, since
+// a plain credential-403 JSON could carry that phrase in its message and a
+// false positive here delays credential rotation to a short backoff.
+// "just a moment" stays standalone because the challenge title sits within
+// the first bytes of the page while the Cloudflare branding may fall past the
+// bounded scan window.
 func IsCloudflareChallengeText(message string) bool {
 	lower := strings.ToLower(message)
-	return strings.Contains(lower, "challenge-platform") ||
-		strings.Contains(lower, "cf-mitigated") ||
+	if strings.Contains(lower, "cloudflare challenge") ||
 		strings.Contains(lower, "just a moment") ||
-		strings.Contains(lower, "attention required") ||
-		strings.Contains(lower, "cloudflare challenge")
+		strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "cf-mitigated") {
+		return true
+	}
+	return strings.Contains(lower, "attention required") && strings.Contains(lower, "cloudflare")
 }
 
 // fromCloudflareChallenge reclassifies a 403 whose *whole* error text carries
