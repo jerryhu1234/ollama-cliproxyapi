@@ -3,6 +3,7 @@ plugins/
 *.so
 *.dylib
 *.dll
+*.test
 *.h
 mgr-git-114/
 scripts/
