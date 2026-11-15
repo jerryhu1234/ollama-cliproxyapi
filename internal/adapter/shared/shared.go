@@ -1172,13 +1172,35 @@ func RetryAfterSeconds(headers http.Header) int {
 // response's Retry-After guidance: the host's conductor times the credential
 // cooldown from RetryAfterSeconds and mirrors it into the client response
 // header, so a 429 refusal must not be re-treated as an untimed burn.
+//
+// Quota-exhaustion policy: a quota-graded 429 (ClassQuota — "quota" or
+// "usage limit" wording) with NO upstream Retry-After would otherwise drop
+// into the host's 1s→2s→4s→…→30min exponential ladder and hammer the account
+// pool. ollama.com returns exactly that bare shape for a monthly usage cap
+// (real sample: "you (user) have reached your monthly usage limit, add ...",
+// no Retry-After header, only a trace id). Recovery from account exhaustion
+// is on a payment/month-rollover timescale, so the plugin schedules the
+// credential_quota probe at 30 minutes — the same cadence the host itself
+// uses for HTTP 402 — capped like every other hint. An upstream-provided
+// header always wins; plain rate-limit 429s keep the ladder.
 func UpstreamStatusErrorWithHeaders(status int, body []byte, headers http.Header) *errclass.Error {
 	e := UpstreamStatusError(status, body)
-	if e != nil {
-		e.RetryAfterSeconds = RetryAfterSeconds(headers)
+	if e == nil {
+		return nil
+	}
+	e.RetryAfterSeconds = RetryAfterSeconds(headers)
+	if e.RetryAfterSeconds == 0 && e.StatusCode == http.StatusTooManyRequests && e.Class == errclass.ClassQuota {
+		e.RetryAfterSeconds = quotaExhaustionProbeSeconds
 	}
 	return e
 }
+
+// quotaExhaustionProbeSeconds is the cooldown the plugin schedules for an
+// account-level exhaustion 429 that carries no upstream Retry-After: 30
+// minutes, the host's own 402 cadence. Recovery is not request-driven — a
+// probe sooner cannot succeed, and probing later than this only delays
+// detecting a payment that revives the account.
+const quotaExhaustionProbeSeconds = 1800
 
 // ResponsesUsage is the token-usage block of synthesized Responses
 // results and terminal response.completed payloads.

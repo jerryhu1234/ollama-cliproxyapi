@@ -87,15 +87,40 @@ func fromCloudflareChallenge(status int, msg string) *Error {
 // full message carries Cloudflare challenge vocabulary is a WAF interstitial,
 // not a credential problem: it becomes ClassUpstream + retryable and is
 // prefixed with the host's "cloudflare challenge" phrase. A redacted message
-// containing "quota" (case-insensitive) upgrades 429/402/403 to ClassQuota —
-// a bounded heuristic given no documented upstream quota taxonomy.
+// carrying quota-exhaustion vocabulary ("quota", or the "usage limit" wording
+// ollama.com actually returns for a monthly usage cap: "you (user) have
+// reached your monthly usage limit, add ...") upgrades 429/402/403 to
+// ClassQuota. For 429 that additionally sets CredentialScoped so the host
+// treats it as whole-credential quota (reason "credential_quota") instead of
+// the generic 429 ladder; 402/403 stay unflagged — the host's 402 branch is
+// already a fixed credential-wide 30-minute cooldown, and the credential-
+// quota routing is documented for 429 only.
 func FromStatus(status int, message string) *Error {
 	msg := Redact(message)
 	if status == 403 && IsCloudflareChallengeText(msg) {
 		return fromCloudflareChallenge(status, msg)
 	}
 	lowerMsg := strings.ToLower(msg)
-	quota := strings.Contains(lowerMsg, "quota")
+	// Window-exhaustion vocabulary. "quota" is the legacy generic term;
+	// "usage limit" covers the observed monthly/weekly caps (two live
+	// samples); "session window"/"session limit" is preemptive for the
+	// Ollama Pro 5-hour session window (whose account-side datum is the
+	// balance API's Session window the predictor already consumes) — the
+	// real 429 wording is still unobserved here, so tighten to the sample
+	// once one lands. Plan structure (per operator-confirmed upstream
+	// behavior): Max carries only a monthly quota; Pro carries a weekly
+	// quota and the 5h session window as two INDEPENDENT budgets, each
+	// prompting its own exhaustion message — a session-window 429 arrives
+	// while weekly balance remains, and vice versa. Both are window
+	// budgets recoverable only on reset (or payment/upgrade), never by
+	// immediate retry, so treating all of them as account-level quota
+	// (whole-credential cooldown, 30-min probes) cannot hurt a genuinely
+	// transient rate limit unless the upstream invents a window name with
+	// different semantics.
+	quota := strings.Contains(lowerMsg, "quota") ||
+		strings.Contains(lowerMsg, "usage limit") ||
+		strings.Contains(lowerMsg, "session window") ||
+		strings.Contains(lowerMsg, "session limit")
 	quotaClass := func(base Class) Class {
 		if quota {
 			return ClassQuota
@@ -112,7 +137,7 @@ func FromStatus(status int, message string) *Error {
 	case 404:
 		return &Error{Class: ClassInvalidModel, Message: msg, StatusCode: status}
 	case 429:
-		return &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true}
+		return &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true, CredentialScoped: quota}
 	}
 	if status >= 500 {
 		return &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true}

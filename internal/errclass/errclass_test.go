@@ -35,6 +35,56 @@ func TestErrorMessage(t *testing.T) {
 	}
 }
 
+// TestUsageLimit429IsAccountLevelQuota pins the ollama.com monthly-cap shape:
+// "you (user) have reached your monthly usage limit, add ..." arrives as a
+// bare 429 with no Retry-After header (the real sample carries only a trace
+// id). It is account-level exhaustion, not a per-model rate limit, so it must
+// upgrade to ClassQuota AND mark CredentialScoped — that pair routes the host
+// to credential_quota instead of the generic 1s→30min exponential ladder.
+func TestUsageLimit429IsAccountLevelQuota(t *testing.T) {
+	e := FromStatus(429, `you (averyllin) have reached your monthly usage limit, add credits or upgrade your plan`)
+	if e.Class != ClassQuota || !e.CredentialScoped || !e.Retryable || e.StatusCode != 429 {
+		t.Fatalf("usage-limit 429 = %+v", e)
+	}
+	// Weekly-cap variant from a second live sample ("you (lunadpe) have
+	// reached your weekly usage limit, upgrade...") — same bare-429 shape,
+	// same substring predicate.
+	weekly := FromStatus(429, `you (lunadpe) have reached your weekly usage limit, upgrade your plan`)
+	if weekly.Class != ClassQuota || !weekly.CredentialScoped || weekly.StatusCode != 429 {
+		t.Fatalf("weekly usage-limit 429 = %+v", weekly)
+	}
+	// Ollama Pro 5-hour session window (account-side: the balance API's
+	// Session window the predictor already consumes). No live 429 sample
+	// yet — these two pin the preemptive vocabulary and must be replaced
+	// with the real message once one is captured.
+	session := FromStatus(429, `you have reached the limit of your 5-hour session window`)
+	if session.Class != ClassQuota || !session.CredentialScoped {
+		t.Fatalf("session-window 429 = %+v", session)
+	}
+	sessionLimit := FromStatus(429, `session limit reached for this account`)
+	if sessionLimit.Class != ClassQuota || !sessionLimit.CredentialScoped {
+		t.Fatalf("session-limit 429 = %+v", sessionLimit)
+	}
+	// A plain rate-limit 429 must NOT be credential-scoped: it keeps the
+	// host's fast-recovery ladder semantics.
+	plain := FromStatus(429, `{"error":{"message":"rate limit exceeded, slow down"}}`)
+	if plain.Class != ClassRateLimit || plain.CredentialScoped {
+		t.Fatalf("plain 429 = %+v", plain)
+	}
+	// The "quota" wording path keeps its upgrade and gains the scope too.
+	quota := FromStatus(429, "quota exceeded for project")
+	if quota.Class != ClassQuota || !quota.CredentialScoped {
+		t.Fatalf("quota 429 = %+v", quota)
+	}
+	// 402 keeps its billing class and is NOT credential-flagged: the host's
+	// 402 branch is already a fixed credential-wide 30-minute cooldown, and
+	// credential_quota routing is documented for 429 only.
+	billing := FromStatus(402, "monthly usage limit reached")
+	if billing.Class != ClassQuota || billing.CredentialScoped {
+		t.Fatalf("402 usage-limit = %+v", billing)
+	}
+}
+
 func TestFromStatus(t *testing.T) {
 	tests := []struct {
 		name      string

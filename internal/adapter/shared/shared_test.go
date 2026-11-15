@@ -488,6 +488,36 @@ func TestUpstreamStatusErrorWithHeaders(t *testing.T) {
 	if e.Class != errclass.ClassUpstream || e.RetryAfterSeconds != 0 {
 		t.Fatalf("headerless = %+v", e)
 	}
+	// Account-level exhaustion 429 with no upstream hint gets the plugin's
+	// 30-minute credential_quota probe instead of the host's fast ladder;
+	// CredentialScoped (set by FromStatus) is what routes it to
+	// whole-credential quota in the first place.
+	e = UpstreamStatusErrorWithHeaders(429,
+		[]byte(`{"error":{"message":"you (averyllin) have reached your monthly usage limit, add credits or upgrade your plan"}}`), nil)
+	if e.Class != errclass.ClassQuota || e.StatusCode != http.StatusTooManyRequests || !e.CredentialScoped {
+		t.Fatalf("usage-limit 429 = %+v", e)
+	}
+	if e.RetryAfterSeconds != 1800 {
+		t.Fatalf("usage-limit 429 hint = %d, want 1800", e.RetryAfterSeconds)
+	}
+	// An upstream-provided header beats the synthetic hint.
+	e = UpstreamStatusErrorWithHeaders(429, []byte(`{"error":{"message":"quota exceeded for project"}}`),
+		http.Header{"Retry-After": []string{"120"}})
+	if e.RetryAfterSeconds != 120 {
+		t.Fatalf("headered quota 429 hint = %d, want 120", e.RetryAfterSeconds)
+	}
+	// A plain rate-limit 429 keeps the ladder: no synthetic hint, no
+	// credential scope.
+	e = UpstreamStatusErrorWithHeaders(429, []byte(`{"error":{"message":"rate limit exceeded, slow down"}}`), nil)
+	if e.Class != errclass.ClassRateLimit || e.RetryAfterSeconds != 0 || e.CredentialScoped {
+		t.Fatalf("plain 429 = %+v", e)
+	}
+	// Quota-graded non-429 statuses get no synthetic hint: the host's 402
+	// branch carries its own fixed credential-wide cooldown.
+	e = UpstreamStatusErrorWithHeaders(402, []byte(`{"error":{"message":"usage limit reached"}}`), nil)
+	if e.RetryAfterSeconds != 0 {
+		t.Fatalf("402 usage-limit hint = %d, want 0", e.RetryAfterSeconds)
+	}
 }
 
 func equalJSON(a, b any) bool {
